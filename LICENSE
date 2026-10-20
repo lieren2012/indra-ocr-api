@@ -1,0 +1,80 @@
+本项目（indra-ocr-service 的源代码）采用 Apache License 2.0。
+
+================================================================================
+                              Apache License
+                        Version 2.0, January 2004
+                     http://www.apache.org/licenses/
+================================================================================
+
+TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+1. Definitions.
+
+   "License" shall mean the terms and conditions for use, reproduction,
+   and distribution as defined by Sections 1 through 9 of this document.
+
+   "Licensor" shall mean the copyright owner or entity authorized by
+   the copyright owner that is granting the License.
+
+   "Legal Entity" shall mean the union of the acting entity and all
+   other entities that control, are controlled by, or are under common
+   control with that entity.
+
+   "You" (or "Your") shall mean an individual or Legal Entity
+   exercising permissions granted by this License.
+
+   "Source" form shall mean the preferred form for making modifications.
+
+   "Object" form shall mean any form resulting from mechanical
+   transformation or translation of a Source form.
+
+   "Work" shall mean the work of authorship made available under the
+   License.
+
+   "Derivative Works" shall mean any work that is based on the Work.
+
+   "Contribution" shall mean any work of authorship submitted to
+   Licensor for inclusion in the Work.
+
+   "Contributor" shall mean Licensor and any individual or Legal Entity
+   on behalf of whom a Contribution has been received by Licensor.
+
+2. Grant of Copyright License. Subject to the terms and conditions of
+   this License, each Contributor hereby grants to You a perpetual,
+   worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+   copyright license to reproduce, prepare Derivative Works, and
+   distribute the Work.
+
+3. Grant of Patent License. Subject to the terms and conditions of
+   this License, each Contributor grants to You a perpetual, worldwide,
+   non-exclusive, no-charge, royalty-free, irrevocable patent license.
+
+4. Redistribution. You may reproduce and distribute copies of the
+   Work provided You retain copyright/license/notice.
+
+5. Submission of Contributions. Unless You explicitly state otherwise,
+   any Contribution intentionally submitted for inclusion in the Work
+   shall be under the terms and conditions of this License.
+
+6. Trademarks. This License does not grant rights to use trademarks.
+
+7. Disclaimer of Warranty. The Work is provided on an "AS IS" BASIS.
+
+8. Limitation of Liability. In no event shall any Contributor be liable.
+
+9. Accepting Warranty or Additional Liability. You may choose to offer
+   warranty/liability on Your own.
+
+END OF TERMS AND CONDITIONS
+
+--------------------------------------------------------------------------------
+第三方许可声明
+--------------------------------------------------------------------------------
+本项目仅是对 Indra OCR 的部署封装，Apache License 2.0 覆盖的是本仓库内的源代码
+（app.py / Dockerfile / 部署脚本等），不包括 Indra 模型权重本身。
+
+Indra 模型权重（datalab-to/indra-ocr，https://huggingface.co/datalab-to/indra-ocr）
+采用修改版 OpenRAIL-M 许可，其使用受 Datalab 的条款约束：
+  - 研究 / 个人 / 营收或融资 < 2000 万美元可免费使用
+  - 不得与 Datalab 的 API 直接竞争
+  - 商用前请查阅上述 HuggingFace 仓库的 LICENSE 与条款

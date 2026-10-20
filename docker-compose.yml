@@ -1,0 +1,35 @@
+services:
+  ocr:
+    build: .
+    image: indra-ocr:1.1.2
+    environment:
+      OCR_THREADS: "8"          # onnxruntime 内部并行线程
+      OCR_WORKERS: "1"          # uvicorn worker；低负载用 1 即可（见 README）
+      INDRA_API_KEY: "${INDRA_API_KEY:-}"   # 空=不鉴权；设了则调用方需带 api_key=
+      HF_HOME: /opt/models
+      HF_HUB_OFFLINE: "1"       # ★ 强制离线，必须用预置模型（见 prepare_models.sh）
+      TMPDIR: /tmp/indra
+    volumes:
+      - ./models:/opt/models:ro   # 只读挂载离线模型
+      - ./tmp:/tmp/indra          # 临时上传文件（务必放到数据盘，如 /www/indra/tmp）
+    deploy:
+      resources:
+        limits:
+          cpus: "8.0"
+          memory: 12G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - ocr
+    restart: unless-stopped

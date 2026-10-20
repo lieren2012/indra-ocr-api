@@ -1,0 +1,18 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 运行时 / 部署产物（不入库）----
+tmp/            # 临时上传文件，运行时生成
+models/         # 离线模型，按 scripts/prepare_models.sh 预置，不入库
+*.log
+
+# ---- 环境变量 / 密钥 ----
+.env
+
+# ---- IDE ----
+.idea/
+.vscode/
