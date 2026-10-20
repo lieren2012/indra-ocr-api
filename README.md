@@ -212,3 +212,15 @@ curl http://localhost:8080/v1/tasks/$TID
 > 注：官方自报 "32 核 49 页/秒" 为自建 benchmark（OmniParseBench）且排除模型加载/warmup。
 > 实际部署按单页 0.5–2s 规划更稳妥（本机实测单页 threads=4 约 0.5s）。
 
+---
+
+## 10. 同类 OCR 产品（参考）
+
+| 项目 | GitHub | 定位 |
+|---|---|---|
+| **Indra**（本仓库封装） | https://github.com/datalab-to/indra | 纯 onnxruntime 轻量 CPU OCR，中文扫描件友好，无 PyTorch/PaddlePaddle 依赖 |
+| RapidOCR | https://github.com/RapidAI/RapidOCR | 轻量端侧推理（PP-OCR 系列），快，但无版面块/表格结构 |
+| PaddleOCR | https://github.com/PaddlePaddle/PaddleOCR | 完整版含 PP-Structure，表格/竖排还原强；代价是需 PaddlePaddle 框架（~500MB+） |
+
+> 三者共同短板：手写体、竖排文字、复杂表格（合并单元格/多级表头/无框线）会丢结构，需上 VLM（如 PaddleOCR-VL / Qwen2.5-VL）补刀。
+
