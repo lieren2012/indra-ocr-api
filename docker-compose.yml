@@ -22,7 +22,7 @@ services:
       MAX_QUEUE: "${MAX_QUEUE:-1000}"       # 队列上限，超出返回 429（背压）
       TMPDIR: /tmp/indra
       HF_HOME: /opt/models
-      HF_HUB_OFFLINE: "1"
+      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-1}"
     volumes:
       - ./tmp:/tmp/indra                    # 与 worker 共享：上传文件落这里
     depends_on:
@@ -45,7 +45,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       OCR_THREADS: "${OCR_THREADS:-8}"      # 每个 worker 占用的线程/核数
       HF_HOME: /opt/models
-      HF_HUB_OFFLINE: "1"
+      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-1}"
       TMPDIR: /tmp/indra
     volumes:
       - ./models:/opt/models:ro             # 只读挂载离线模型
@@ -74,7 +74,7 @@ services:
   nginx:
     image: nginx:1.27-alpine
     ports:
-      - "8080:80"
+      - "${INDRA_PORT:-8080}:80"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:

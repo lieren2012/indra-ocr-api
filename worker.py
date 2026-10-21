@@ -74,12 +74,31 @@ def _heartbeat_loop() -> None:
         _stop.wait(HB_REFRESH)
 
 
-# 结果写不进 Redis 时，把任务从 processing **原子** 搬回队列（重投）。
-# RPUSH 在前、LREM 在后：若 RPUSH 失败则整个脚本报错、LREM 不执行，
-# 任务仍安全留在 processing，绝不会出现"既不在队列也不在 processing"的丢失。
+# 重投：一个 Lua 里完成「看状态 → 置 pending → 入队 → 移出 processing」。
+# 必须原子，否则会出现这两类覆盖竞争：
+#   - 先入队再改状态：别的 worker 抢先算完写了 done，本 worker 又把状态改回 pending；
+#   - 改状态和入队分两次网络往返：任意一步失败就留下"状态 pending 但不在队列"的僵尸任务。
+# 因此：
+#   - 任务已是 done（别人已经算完）→ 只清理，绝不回退状态；
+#   - 任务哈希已过期 → 直接丢弃；
+#   - 其余 → **先置 pending 再入队**，取到它的 worker 看到的已经是 pending。
 _REQUEUE_LUA = """
-redis.call('RPUSH', KEYS[2], ARGV[1])
-redis.call('LREM', KEYS[1], 1, ARGV[1])
+local plist = KEYS[1]
+local queue = KEYS[2]
+local key   = KEYS[3]
+local jid   = ARGV[1]
+if redis.call('EXISTS', key) == 0 then
+  redis.call('LREM', plist, 1, jid)
+  return 0
+end
+if redis.call('HGET', key, 'status') == 'done' then
+  redis.call('LREM', plist, 1, jid)
+  return 0
+end
+redis.call('HSET', key, 'status', 'pending')
+redis.call('HDEL', key, 'processing_since')
+redis.call('RPUSH', queue, jid)
+redis.call('LREM', plist, 1, jid)
 return 1
 """
 
@@ -98,27 +117,28 @@ def _try_lrem(jid: str, delete_path: "str | None" = None) -> None:
             pass
 
 
-def _requeue(job_id: str) -> None:
-    """结果写不进 Redis 时主动重投，避免任务卡在本 worker 手里永远不重试。
-    重投也失败 → 结束本进程，让心跳过期、由看门狗兜底回收。"""
+def _requeue(job_id: str, strict: bool = True) -> bool:
+    """安全重投。返回是否成功。
+
+    strict=True（正常处理路径）：重试 3 次仍失败 → 结束进程，让心跳过期、
+      看门狗按 processing 列表兜底回收。绝不"什么都不做就继续跑"。
+    strict=False（优雅退出时）：失败就返回 False，由调用方保留注册信息，
+      交看门狗处理（此时不能自杀，否则列表会没人管）。
+    """
     for _ in range(3):
         try:
-            r.eval(_REQUEUE_LUA, 2, PROC_LIST, QUEUE, job_id)
+            r.eval(_REQUEUE_LUA, 3, PROC_LIST, QUEUE, f"ocr:job:{job_id}", job_id)
+            return True
         except Exception:
             time.sleep(0.5)
-            continue
-        try:
-            r.hset(f"ocr:job:{job_id}", "status", "pending")
-            r.hdel(f"ocr:job:{job_id}", "processing_since")
-        except Exception:
-            pass
-        return
-    print(
-        f"[worker {WORKER_ID}] FATAL: cannot persist nor requeue job {job_id}; "
-        f"exiting so reaper recovers it after heartbeat TTL",
-        flush=True,
-    )
-    os._exit(2)
+    if strict:
+        print(
+            f"[worker {WORKER_ID}] FATAL: cannot requeue job {job_id}; "
+            f"exiting so reaper recovers it after heartbeat TTL",
+            flush=True,
+        )
+        os._exit(2)
+    return False
 
 
 def _finalize(job_key: str, jid: str, path: "str | None", mapping: dict) -> bool:
@@ -154,13 +174,23 @@ def _finalize(job_key: str, jid: str, path: "str | None", mapping: dict) -> bool
 
 def process(job_id: str) -> None:
     job_key = f"ocr:job:{job_id}"
-    try:
-        job = r.hgetall(job_key)
-    except Exception:
-        return  # 读不到 → 保留在 processing，看门狗会重投
+
+    # 读任务状态。读失败**不能**直接 return：心跳还在，看门狗不会回收，
+    # 任务就永远卡在这个 processing 列表里（这正是最容易漏的一类死锁）。
+    # 改为重投——重投脚本自己在 Redis 里判断状态，done 的只清理、不会重算。
+    job = None
+    for _ in range(2):
+        try:
+            job = r.hgetall(job_key)
+            break
+        except Exception:
+            time.sleep(0.3)
+    if job is None:
+        _requeue(job_id)
+        return
 
     if not job:
-        _try_lrem(job_id)
+        _try_lrem(job_id)   # 任务已过期/不存在，清掉 processing 记录即可
         return
 
     # 已经成功过（上次落库后没来得及移出就被重投）：只清理，不重算、绝不改成 error
@@ -177,14 +207,21 @@ def process(job_id: str) -> None:
             _requeue(job_id)
         return
 
+    # 先标记 processing。这一步写不进去说明 Redis 有问题 —— 重投，而不是
+    # 继续跑并在 OCR 之后把本可能成功的任务标成 error。
     try:
         r.hset(job_key, mapping={"status": "processing", "processing_since": str(time.time())})
+    except Exception:
+        _requeue(job_id)
+        return
+
+    try:
         t0 = time.time()
         result = ocr_engine.run_ocr(path, max_pages)
         elapse = round(time.time() - t0, 3)
     except Exception as exc:  # noqa: BLE001
         if not _finalize(job_key, job_id, path, {"status": "error", "error": str(exc)}):
-            _requeue(job_id)  # 连 error 都写不进 Redis → 重投，别让任务卡死
+            _requeue(job_id)
         return
 
     # OCR 成功：落库失败 → 重投（而不是留在 processing 里卡死）
@@ -203,14 +240,29 @@ def process(job_id: str) -> None:
 
 
 def _cleanup() -> None:
-    """优雅退出：把本 worker 未处理完的任务重新入队，并注销自己。"""
+    """优雅退出：把本 worker 未处理完的任务逐个原子重投，再注销自己。
+
+    若有任务没能安全重投，**不注销、不删心跳**：心跳过期后看门狗会按
+    processing 列表兜底。否则列表会变成没人认领的孤儿。
+    """
     try:
         jobs = r.lrange(PROC_LIST, 0, -1)
-        if jobs:
-            r.rpush(QUEUE, *jobs)
-            for jid in jobs:
-                r.hset(f"ocr:job:{jid}", "status", "pending")
-                r.hdel(f"ocr:job:{jid}", "processing_since")
+    except Exception:
+        return  # Redis 都读不到，什么都别动，交看门狗
+
+    all_ok = True
+    for jid in jobs:
+        if not _requeue(jid, strict=False):
+            all_ok = False
+    if not all_ok:
+        print(
+            f"[worker {WORKER_ID}] shutdown: some jobs could not be requeued; "
+            f"leaving them for reaper",
+            flush=True,
+        )
+        return
+
+    try:
         r.delete(PROC_LIST)
         r.srem(WORKERS_SET, WORKER_ID)
         r.delete(HEARTBEAT_KEY)

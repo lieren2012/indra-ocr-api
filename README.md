@@ -37,11 +37,13 @@ Worker 池（加载模型，吃算力）：BLMOVE 取任务 → 跑 OCR → 结�
 
 | 项 | 默认 | 说明 / 怎么改 |
 |---|---|---|
+| **访问端口** `INDRA_PORT` | **8080** | `.env` 里改；对外就是 `http://<IP>:8080` |
 | **Worker 副本数** | **1** | compose 不写死 `replicas`；用 `--scale worker=N` 或 `scripts/autoscale.sh` 增减，**只动 worker** |
-| **每 Worker 线程数** `OCR_THREADS` | **8** | onnxruntime 线程数，≈ 该副本占用的核数；改 `.env` 或 compose 环境变量 |
+| **每 Worker 线程数** `OCR_THREADS` | **8** | onnxruntime 线程数，≈ 该副本占用的核数；`deploy.sh` 会按核数自动推荐（≈ 核数/4，夹在 2–8） |
 | 单机总线程 | 副本数 × `OCR_THREADS` ≤ 物理核数 | 32 核 → 顶格 4 副本 × 8 线程；超了上下文切换反而掉速 |
 | 单副本 CPU 上限 | `cpus: 8.0` | `deploy.resources.limits`，与 `OCR_THREADS` 对齐 |
 | 单副本内存上限 | `2G` | 模型 72MB + onnxruntime 运行时；实际 RSS 以 `docker stats` 为准 |
+| 模型来源 `HF_HUB_OFFLINE` | `1`（离线） | `deploy.sh` 在 `models/` 为空时自动置 `0` 允许首次联网下载 |
 | 队列上限 `MAX_QUEUE` | `1000` | 超过则 `POST /v1/jobs` 返 `429`，形成背压 |
 | 结果保留 `JOB_TTL` | `86400`（24h） | 过期自动删除任务哈希 |
 | Worker 心跳 TTL / 刷新 | `60s` / `15s` | 进程真挂约 60s 内被发现 |
@@ -67,6 +69,7 @@ Worker 池（加载模型，吃算力）：BLMOVE 取任务 → 跑 OCR → 结�
 
 ```
 indra-ocr-service/
+├── deploy.sh               # ★ 一键部署（生成密钥/启动/打印地址/可选开自动伸缩）
 ├── api.py                  # API 服务（收任务、查状态、鉴权、背压、看门狗）
 ├── worker.py               # Worker（可靠取任务、独立心跳、跑 OCR）
 ├── ocr_engine.py           # OCR 引擎封装（被 Worker 加载，模型常驻）
@@ -105,6 +108,46 @@ bash scripts/prepare_models.sh ./models
 ---
 
 ## 5. 部署（Docker，推荐）
+
+### 5.1 一键部署（最省事）
+
+```bash
+git clone https://github.com/lieren2012/indra-ocr-api.git
+cd indra-ocr-api
+bash deploy.sh
+```
+
+脚本会依次做完这些事，**过程中会问你两个问题**：
+
+1. 检查 docker / compose / curl（不满足直接告诉你怎么装）
+2. 按 CPU 核数推荐「每个 Worker 线程数」和「最多几个 Worker」
+   （8 核 → 2 线程 × 最多 4 个；32 核 → 8 线程 × 最多 4 个）
+3. **生成 `.env`，里面自动带一个 48 位随机 API Key**（权限 600）。已有 `.env` 就沿用，不会覆盖你的密钥
+4. 没有 `models/` 就问你**要不要联网下模型**（约 72MB）；有就按离线模式跑
+5. `docker compose up -d --build`，然后轮询 `/readyz` **等到真的有 Worker 在线**才算部署成功
+6. 打印并写进 `deploy-info.txt`：
+
+```
+ 局域网地址 : http://192.168.1.20:8080     ← 填到知识库/其他系统里
+ 本机地址   : http://127.0.0.1:8080
+ API Key    : 6431f078b7823e195c5aefc989c852943425378b3572
+```
+
+7. 最后问你：**是否开启自动伸缩**（默认 1 个 Worker，积压时自动加到 4 个，空闲 2 分钟减回 1 个）
+   - root 运行 → 装成 `indra-autoscale.service`，**重启后自动拉起**
+   - 非 root → 后台 `nohup` 跑，并告诉你 PID 和日志位置
+   - 选「否」也随时能开：`sudo bash deploy.sh -y --autoscale`
+
+非交互（脚本/CI）用法：
+
+```bash
+bash deploy.sh -y                  # 全默认
+bash deploy.sh -y --autoscale      # 部署完直接开伸缩
+bash deploy.sh -y --no-autoscale   # 不开
+bash deploy.sh --port=9000         # 换端口
+```
+
+### 5.2 手动部署（想自己掌控每一步）
 
 ```bash
 cd indra-ocr-service
@@ -267,8 +310,12 @@ curl "http://localhost:8080/v1/jobs/$JID?api_key=你的密钥"
 2. **Redis 持久化 + 不淘汰**：开启 **AOF**（`appendfsync everysec`，掉电最多丢 ~1s 写入）；**`noeviction`**（内存满时**写失败而非淘汰队列/任务/心跳**，API 返回 503 让调用方重试，绝不静默丢数据）；结果保留 24h（`JOB_TTL`）后自动过期。
 3. **监控**：`/readyz` 做验收（无在线 Worker 直接 503），`/healthz` 看 `active_workers` / `queued`。Worker 心跳由**独立线程**每 15s 刷新、TTL 60s，**长文档处理期间也不会误判离线**；进程真挂了约 60s 内被发现。Compose 健康检查：**api 用 `/readyz`、worker 用自身心跳**，`docker compose ps` 能看到真实健康态。
 4. **不丢任务**：任务先 `BLMOVE` 原子挪到 `ocr:processing:{worker}`；**结果成功落库才** `LREM` + 删文件（落库失败 → 原子重投回队列，绝不删文件）。看门狗每 30s 用**原子 Lua 脚本**回收心跳过期 Worker 的处理列表。
-   - 落库失败：重投 3 次；仍失败则 Worker 主动退出（心跳过期 → 看门狗兜底），**不会卡在某个 Worker 手里无人重试**。
-   - `LREM` 失败：**保留文件**，避免任务日后被重投时因"文件不存在"报错并覆盖原本成功的结果。
+   - **读状态失败也重投**：`HGETALL` 失败时不能干等——心跳还在，看门狗不会回收，任务会永久卡住。改为直接重投。
+   - **重投是一个原子脚本**：查状态 → 置 `pending` → 入队 → 移出 processing 全在一个 Lua 里，不存在"已入队但状态还没改"的空窗；且**发现任务已 `done` 就只清理，绝不把状态回退成 `pending`**（避免"别人算完了、旧 Worker 又改回 pending"的覆盖竞争）。
+   - **看门狗同理**：整表回收 + 状态守卫在同一个 Lua 里；已完成的任务只丢弃不入队。
+   - 重投 3 次仍失败 → Worker 主动退出（心跳过期 → 看门狗兜底），**不会卡在某个 Worker 手里无人重试**。
+   - `LREM` 失败 → **保留文件**，避免任务日后被重投时因"文件不存在"报错并覆盖原本成功的结果。
+   - 优雅退出时若有任务没能安全重投，**不注销自己**，留给看门狗，避免 processing 列表变成孤儿。
    - 已 `done` 的任务被重投：只清理记录，**不重算、绝不改成 error**（幂等）。
 5. **扩容/缩容**：见 §6；`docker compose ps -q worker | grep -c .` 确认实际副本数。
 6. **合规**：Indra 权重为修改版 OpenRAIL-M，营收 >2000 万美元或与 Datalab API 竞争不可用，部署前确认。
@@ -287,6 +334,7 @@ curl "http://localhost:8080/v1/jobs/$JID?api_key=你的密钥"
 | Redis 掉电 / 内存满 | 已开 AOF（`everysec`，最多丢 ~1s）+ `noeviction`（写满返 503，**不淘汰任务**）；生产建议再加 Redis 主从/备份 |
 | Redis 是关键依赖 | 没有 Redis 整个服务不可用；务必开持久化 |
 | 自动伸缩不生效 | 确认 `autoscale.sh` 在**宿主机**、有 docker 权限；`journalctl -u indra-autoscale -f` 看是否有 `LLEN` 失败 |
+| 一键部署卡在"等待服务就绪" | 看 `docker compose logs --tail=50 worker`：最常见是 `models/` 为空又没外网（把 `.env` 的 `HF_HUB_OFFLINE` 改 0 联网下载，或预置模型）；其次是端口被占、内存不足 |
 
 ---
 

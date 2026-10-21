@@ -100,49 +100,81 @@ def readyz() -> dict:
 # --------------------------------------------------------------------------- #
 # 看门狗：把死掉 Worker 的 processing 列表重新入队，避免丢任务
 # --------------------------------------------------------------------------- #
-# 原子地把某个死 worker 的 processing 列表整体挪回队列：
-# LMOVE 逐个搬本身是原子的，整个 Lua 脚本又在 Redis 内单线程执行，
-# 因此不存在"搬了一半"的中间可见状态，也就不会产生重复任务。
+# 整个回收过程放在**一个 Lua 脚本**里，Redis 单线程执行 = 原子：
+#   - 已完成(done)的任务：只从 processing 移出，**绝不回退成 pending**
+#     （否则会出现"别的 worker 已经算完、看门狗又把它标回 pending"的覆盖竞争）
+#   - 任务哈希已过期：直接丢弃，不留垃圾
+#   - 其余：**先置 pending 再入队**，保证任何 worker 取到它时状态已经是 pending
+# 返回 {moved, dropped}：重投的 / 丢弃的。
 _REAP_LUA = """
-local plist = KEYS[1]
-local queue = KEYS[2]
-local ids = {}
+local plist  = KEYS[1]
+local queue  = KEYS[2]
+local prefix = ARGV[1]
+local moved, dropped = {}, {}
 while true do
-  local jid = redis.call('LMOVE', plist, queue, 'RIGHT', 'LEFT')
+  local jid = redis.call('LINDEX', plist, -1)
   if not jid then break end
-  ids[#ids+1] = jid
+  local key = prefix .. jid
+  if redis.call('EXISTS', key) == 0 then
+    redis.call('LREM', plist, 1, jid)
+    dropped[#dropped+1] = jid
+  elseif redis.call('HGET', key, 'status') == 'done' then
+    redis.call('LREM', plist, 1, jid)
+    dropped[#dropped+1] = jid
+  else
+    redis.call('HSET', key, 'status', 'pending')
+    redis.call('HDEL', key, 'processing_since')
+    redis.call('RPUSH', queue, jid)
+    redis.call('LREM', plist, 1, jid)
+    moved[#moved+1] = jid
+  end
 end
-return ids
+return {moved, dropped}
+"""
+
+# 只删自己持有的锁：锁可能已过期并被别的 API 副本重新拿到
+_UNLOCK_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
 """
 
 
 def _reap_once() -> None:
     # 多 API 副本时用 Redis 锁保证同一时刻只有一个在看门
-    if not r.set(REAPER_LOCK, "1", nx=True, ex=30):
+    token = uuid.uuid4().hex
+    try:
+        if not r.set(REAPER_LOCK, token, nx=True, ex=30):
+            return
+    except Exception:
         return
     try:
         for wid in list(r.smembers(WORKERS_SET)):
-            if r.exists(f"ocr:worker:{wid}"):
-                continue  # 心跳还在 → 活着，跳过
+            try:
+                if r.exists(f"ocr:worker:{wid}"):
+                    continue  # 心跳还在 → 活着，跳过
+            except Exception:
+                continue
             plist = f"ocr:processing:{wid}"
             try:
-                moved = r.eval(_REAP_LUA, 2, plist, QUEUE) or []
+                res = r.eval(_REAP_LUA, 2, plist, QUEUE, "ocr:job:") or []
+                moved = (res[0] or []) if len(res) > 0 else []
+                dropped = (res[1] or []) if len(res) > 1 else []
             except Exception:
-                continue  # 这段失败就下次再试，绝不留下"半搬"的重复任务
-            for jid in moved:
-                try:
-                    # 状态重置失败无妨：任务已在队列，Worker 处理时会覆盖为 processing
-                    r.hset(f"ocr:job:{jid}", "status", "pending")
-                    r.hdel(f"ocr:job:{jid}", "processing_since")
-                except Exception:
-                    pass
+                continue  # 这段失败就下次再试，不会留下"半搬"的重复任务
+            if moved or dropped:
+                print(
+                    f"[reaper] worker {wid} dead: requeued={len(moved)} already-done-dropped={len(dropped)}",
+                    flush=True,
+                )
             try:
                 r.srem(WORKERS_SET, wid)
             except Exception:
                 pass
     finally:
         try:
-            r.delete(REAPER_LOCK)
+            r.eval(_UNLOCK_LUA, 1, REAPER_LOCK, token)
         except Exception:
             pass
 
