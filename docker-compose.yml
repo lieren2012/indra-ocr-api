@@ -17,7 +17,7 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       INDRA_API_KEY: "${INDRA_API_KEY:-}"   # 空=不鉴权；公开部署务必设置
-      MAX_QUEUE: "1000"                     # 队列上限，超出返回 429（背压）
+      MAX_QUEUE: "${MAX_QUEUE:-1000}"       # 队列上限，超出返回 429（背压）
       TMPDIR: /tmp/indra
       HF_HOME: /opt/models
       HF_HUB_OFFLINE: "1"
@@ -39,7 +39,7 @@ services:
     command: ["python", "worker.py"]
     environment:
       REDIS_URL: redis://redis:6379/0
-      OCR_THREADS: "8"                      # 每个 worker 占用的线程/核数
+      OCR_THREADS: "${OCR_THREADS:-8}"      # 每个 worker 占用的线程/核数
       HF_HOME: /opt/models
       HF_HUB_OFFLINE: "1"
       TMPDIR: /tmp/indra
