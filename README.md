@@ -29,7 +29,8 @@ Worker 池（加载模型，吃算力）：BLMOVE 取任务 → 跑 OCR → 结�
 
 单机一套 compose 即可跑；要更高吞吐就加 Worker 副本或加机器，API 不用动。
 
-> ⚠️ **吞吐实话**：队列管理负载，但不创造算力。线程数只加速单页内部的推理，**总吞吐靠 Worker 副本数**（换算见 §2）。
+> ⚠️ **吞吐实话**：队列管理负载，但不创造算力。**一个 worker 默认只吃 1 个线程（1 核）**，不够就自动加第二个、第三个……最多 8 个。
+> 单 worker 把 `OCR_THREADS` 调大只会让**单个文档更快**，不会让总吞吐更高（换算见 §2）。
 
 ---
 
@@ -38,11 +39,11 @@ Worker 池（加载模型，吃算力）：BLMOVE 取任务 → 跑 OCR → 结�
 | 项 | 默认 | 说明 / 怎么改 |
 |---|---|---|
 | **访问端口** `INDRA_PORT` | **8080** | 不填就是 8080；`.env` 里改最持久，`--port=N` 临时指定；被占用自动顺延并写回 `.env` |
-| **Worker 副本数** | **1** | compose 不写死 `replicas`；用 `--scale worker=N` 或 `scripts/autoscale.sh` 增减，**只动 worker** |
-| **每 Worker 线程数** `OCR_THREADS` | **8** | onnxruntime 线程数，≈ 该副本占用的核数；`deploy.sh` 会按核数自动推荐（≈ 核数/4，夹在 2–8） |
-| 单机总线程 | 副本数 × `OCR_THREADS` ≤ 物理核数 | 32 核 → 顶格 4 副本 × 8 线程；超了上下文切换反而掉速 |
-| 单副本 CPU 上限 | `cpus: 8.0` | `deploy.resources.limits`，与 `OCR_THREADS` 对齐 |
-| 单副本内存上限 | `2G` | 模型 72MB + onnxruntime 运行时；实际 RSS 以 `docker stats` 为准 |
+| **Worker 副本数** | **1** | compose 不写死 `replicas`；自动伸缩在 **1→8** 之间增减，**只动 worker** |
+| **每 Worker 线程数** `OCR_THREADS` | **1** | 一个 worker = 1 个线程 = 约 1 个核。`2` 会让单文档更快但副本要相应减少，总线程数别超过物理核数 |
+| 单机总线程 | 副本数 × `OCR_THREADS` ≤ 物理核数 | 1 线程/副本时，8 核机器顶格就是 8 个副本 |
+| 单副本 CPU 上限 | `cpus: 1.5` | `deploy.resources.limits`，1 线程留点余量给解码/IO；`WORKER_CPUS` 可改 |
+| 单副本内存上限 | `1g` | 模型权重 72MB（同一份文件，页缓存共享）+ onnxruntime 运行时；8 副本合计实测约 2–3GB，`WORKER_MEM` 可改 |
 | 模型来源 `HF_HUB_OFFLINE` | `1`（离线） | `deploy.sh` 在 `models/` 为空时自动置 `0` 允许首次联网下载 |
 | 队列上限 `MAX_QUEUE` | `1000` | 超过则 `POST /v1/jobs` 返 `429`，形成背压 |
 | 结果保留 `JOB_TTL` | `86400`（24h） | 过期自动删除任务哈希 |
@@ -50,17 +51,20 @@ Worker 池（加载模型，吃算力）：BLMOVE 取任务 → 跑 OCR → 结�
 | 看门狗间隔 | `30s` | 跑在 API 进程内，扫死 Worker 的处理列表并原子重投 |
 | Redis 内存策略 | `maxmemory 1gb` + `noeviction` | 内存满时**写失败**（API 返 503）而不是淘汰队列；结果体大就调到 `2gb`/`4gb` |
 | Redis 持久化 | AOF `appendfsync everysec` | 掉电最多丢 ~1s 写入 |
-| 伸缩上下限 | `MIN_WORKERS=1` `MAX_WORKERS=4` | 见 §6 |
-| 伸缩采样 / 空闲 / 冷却 | `INTERVAL=5s` `IDLE_SECS=120s` `SCALE_COOLDOWN=30s` | 见 §6 |
+| 伸缩上下限 | `MIN_WORKERS=1` `MAX_WORKERS=8` | 见 §6；上限超过核数会被自动夹到核数 |
+| 伸缩采样 / 空闲 / 冷却 | `INTERVAL=5s` `IDLE_SECS=90s` `SCALE_COOLDOWN=15s` | 见 §6 |
 
-**容量换算**（按单页 0.5–2s 估）：
+**容量换算**（1 线程/副本，按单页 0.5–2s 估；8 线程跑单文档约快 3–5 倍）：
 
-| 配置 | 小时处理量 |
-|---|---|
-| 1 Worker × 8 线程 | 约 1 800–3 600 页/h |
-| 2 Worker | 约 3 600–7 200 页/h |
-| 4 Worker（32 核机器） | 约 7 000–14 000 页/h |
+| 配置 | 小时处理量 | 适合 |
+|---|---|---|
+| 1 Worker × 1 线程 | 约 400–800 页/h | 默认起步，够小团队日常用 |
+| 4 Worker × 1 线程 | 约 1 600–3 200 页/h | 8 核机器，中等批量 |
+| 8 Worker × 1 线程 | 约 3 200–6 400 页/h | 8 核机器顶格，批量灌文档 |
+| 1 Worker × 8 线程 | 约 1 800–3 600 页/h | 只处理**单个大文档**、追求单篇速度时用这种"少而胖"形态 |
 
+> 两种形态总吞吐接近，区别在**单文档延迟**：8 线程那档单篇快 3–5 倍，但同一时刻只能跑 1 个文档；
+> 8 个 1 线程副本能同时跑 8 个文档，单篇慢一些。**批量导入选前者，交互式逐篇查选后者。**
 > 要 3 万+/小时得**多机跑 Worker**（§6 方式 C），单机核数不够。
 
 ---
@@ -125,8 +129,8 @@ bash deploy.sh
 > 或写成非法值，都按 8080 处理。
 
 1. 检查 docker / compose / curl（不满足直接告诉你怎么装）
-2. 按 CPU 核数推荐「每个 Worker 线程数」和「最多几个 Worker」
-   （8 核 → 2 线程 × 最多 4 个；32 核 → 8 线程 × 最多 4 个）
+2. 定下 Worker 形态：**1 个 worker = 1 线程 = 1 核**；扩容上限取 `min(8, CPU 核数)`
+   （4 核 → 最多 4 个；8 核及以上 → 最多 8 个），写进 `.env`
 3. **生成 `.env`，里面自动带一个 48 位随机 API Key 和端口**（权限 600）。已有 `.env` 就沿用，不会覆盖你的密钥
 4. 没有 `models/` 就问你**要不要联网下模型**（约 72MB）；有就按离线模式跑
 5. `docker compose up -d --build`，然后轮询 `/readyz` **等到真的有 Worker 在线**才算部署成功
@@ -138,7 +142,7 @@ bash deploy.sh
  API Key    : 6431f078b7823e195c5aefc989c852943425378b3572
 ```
 
-7. 最后问你：**是否开启自动伸缩**（默认 1 个 Worker，积压时自动加到 4 个，空闲 2 分钟减回 1 个）
+7. 最后问你：**是否开启自动伸缩**（默认 1 个 Worker，积压时逐个加到 8 个，空闲 90 秒再逐个减回 1 个）
    - root 运行 → 装成 `indra-autoscale.service`，**重启后自动拉起**
    - 非 root → 后台 `nohup` 跑，并告诉你 PID 和日志位置
    - 选「否」也随时能开：`sudo bash deploy.sh -y --autoscale`
@@ -185,25 +189,28 @@ curl http://localhost:8080/readyz
 
 ---
 
-## 6. 自动伸缩（1 → 2 → 3 → 4，怎么加、怎么减）
+## 6. 自动伸缩（1 → 2 → 3 → … → 8，怎么加、怎么减）
 
 ### 6.1 规则
 
 | 触发 | 判定条件 | 动作 |
 |---|---|---|
-| **扩容** | 每 `INTERVAL=5s` 采样 `LLEN ocr:queue`，**> 0**（即有任务在排队等 Worker）且距上次调整 ≥ `SCALE_COOLDOWN=30s` | 副本 **+1**，上限 `MAX_WORKERS=4` |
-| **缩容** | 队列连续为 0 累计 ≥ `IDLE_SECS=120s`，且当前 > `MIN_WORKERS`，且不在冷却期 | 副本 **−1**，下限 `MIN_WORKERS=1` |
+| **扩容** | 每 `INTERVAL=5s` 采样 `LLEN ocr:queue`，**> 0**（即有任务在排队等 Worker）且距上次调整 ≥ `SCALE_COOLDOWN=15s` | 副本 **+1**，上限 `MAX_WORKERS=8` |
+| **缩容** | 队列连续为 0 累计 ≥ `IDLE_SECS=90s`，且当前 > `MIN_WORKERS`，且不在冷却期 | 副本 **−1**，下限 `MIN_WORKERS=1` |
 | **钳制** | 任何情况下结果都夹在 `[MIN_WORKERS, MAX_WORKERS]` | — |
 | **读不到队列** | `redis-cli` 报错 / `exec` 失败（返回非纯数字） | **本轮跳过**，既不扩也不缩，避免误判抖动 |
 | **失败重试** | `docker compose up -d --scale` 报错则保持现状，`SCALE_COOLDOWN` 后重试 | 不中断服务 |
 
-即：**默认 1 个 → 一条任务排队就说明 1 个跑不动 → 加第 2 个 → 还积压 → 第 3 个 → 第 4 个为止；队列空满 2 分钟再逐个减回 1 个。**
-积压时 1→4 大约 **1 分钟**（每次加完留 30s 给新 Worker 加载模型、开始消费）。
+即：**默认 1 个（1 线程）→ 有任务排队就说明 1 个跑不动 → 加第 2 个 → 还积压 → 第 3 个 …… 一路到第 8 个；队列连续空闲 90s 再逐个减回 1 个。**
+积压时 1→8 大约 **2 分钟**（每次加完留 15s 给新 Worker 加载模型、开始消费）。
+
+- 上限默认 8，但**超过 CPU 核数会自动夹到核数**（1 线程/副本，副本比核多只会互相抢 CPU，控制器启动时会打一行日志说明）。
+- 已经顶到上限、队列还在积压：日志会打 `backlog=N but already at max=8 workers`，这时候只能**加机器**（§6.5）或改大 `MAX_WORKERS`（前提是核够）。
 
 ### 6.2 手动
 
 ```bash
-docker compose up -d --scale worker=4     # N = floor(核数 / OCR_THREADS)
+docker compose up -d --scale worker=6     # N ≤ min(8, 物理核数 / OCR_THREADS)
 ```
 
 ### 6.3 自动（推荐）
@@ -216,14 +223,14 @@ bash scripts/autoscale.sh
 nohup bash scripts/autoscale.sh >>/var/log/indra-autoscale.log 2>&1 &
 ```
 
-可调参数：`MIN_WORKERS=1 MAX_WORKERS=4 INTERVAL=5 IDLE_SECS=120 SCALE_COOLDOWN=30`。
+可调参数：`MIN_WORKERS=1 MAX_WORKERS=8 INTERVAL=5 IDLE_SECS=90 SCALE_COOLDOWN=15`。
 写在 `.env` 里也行（脚本启动时会加载同目录 `.env`），或用 systemd 的 `Environment=` 覆盖。
 
 ```bash
 # .env
 MIN_WORKERS=1
-MAX_WORKERS=4        # 一般 = floor(物理核数 / OCR_THREADS)
-OCR_THREADS=8
+MAX_WORKERS=8        # ≤ min(8, 物理核数 / OCR_THREADS)
+OCR_THREADS=1        # 1 = 一个 worker 一个核
 ```
 
 ### 6.4 保证控制器本身不倒（systemd）
@@ -241,10 +248,10 @@ Requires=docker.service
 Type=simple
 WorkingDirectory=/opt/indra-ocr-service
 Environment=MIN_WORKERS=1
-Environment=MAX_WORKERS=4
+Environment=MAX_WORKERS=8
 Environment=INTERVAL=5
-Environment=IDLE_SECS=120
-Environment=SCALE_COOLDOWN=30
+Environment=IDLE_SECS=90
+Environment=SCALE_COOLDOWN=15
 ExecStart=/bin/bash /opt/indra-ocr-service/scripts/autoscale.sh
 Restart=always
 RestartSec=10

@@ -18,7 +18,7 @@ Indra OCR Worker（v2.2 —— 可靠队列 + 独立心跳 + 失败自动重投�
   HF_HOME         模型缓存目录（离线部署指向预置目录）
   HF_HUB_OFFLINE  1 强制离线
   TMPDIR          与 api.py 共享的落盘目录
-  OCR_THREADS     onnxruntime 线程数（默认 8）
+  OCR_THREADS     onnxruntime 线程数（默认 1；加大只加快单文档，不加总吞吐）
   WORKER_HEARTBEAT_TTL  心跳 TTL 秒（默认 60）
   WORKER_HEARTBEAT_REFRESH 心跳刷新间隔秒（默认 15）
 """
@@ -38,7 +38,7 @@ import ocr_engine
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 TMPDIR = os.getenv("TMPDIR", "/tmp/indra")
-OCR_THREADS = int(os.getenv("OCR_THREADS", "8"))
+OCR_THREADS = int(os.getenv("OCR_THREADS", "1"))
 JOB_TTL = int(os.getenv("JOB_TTL", "86400"))
 HB_TTL = int(os.getenv("WORKER_HEARTBEAT_TTL", "60"))
 HB_REFRESH = int(os.getenv("WORKER_HEARTBEAT_REFRESH", "15"))

@@ -129,15 +129,15 @@ docker compose version >/dev/null 2>&1 || die "需要 Docker Compose v2（命令
 command -v curl >/dev/null 2>&1 || die "没找到 curl（用来做就绪检查）。"
 
 NPROC=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
-# 每 Worker 线程数 ≈ 核数/4，夹在 [2,8]：既能让多份文档并行，又不至于 1 核 1 线程太慢。
-THREADS=$((NPROC / 4))
-[ "$THREADS" -lt 2 ] && THREADS=2
-[ "$THREADS" -gt 8 ] && THREADS=8
-MAX_WORKERS=$((NPROC / THREADS))
+# 默认形态：1 个 worker 只吃 1 个线程（1 核），吞吐靠"多开几个 worker"顶。
+# 扩容上限取 min(8, 核数) —— 1 线程/副本，副本比核多只会互相抢 CPU。
+THREADS=1
+MAX_WORKERS="$NPROC"
 [ "$MAX_WORKERS" -lt 1 ] && MAX_WORKERS=1
-[ "$MAX_WORKERS" -gt 4 ] && MAX_WORKERS=4
+[ "$MAX_WORKERS" -gt 8 ] && MAX_WORKERS=8
 
-say "CPU 核数: $NPROC → 每个 Worker 用 $THREADS 线程，最多可扩到 $MAX_WORKERS 个 Worker"
+say "CPU 核数: $NPROC → 每个 Worker 1 线程（1 核），最多可扩到 $MAX_WORKERS 个 Worker"
+say "        （一个跑不动就自动加第二个、第三个… 队列空了再缩回 1 个）"
 say "        （想改：编辑 .env 的 OCR_THREADS / MAX_WORKERS，再 docker compose up -d）"
 
 # --------------------------------------------------------------------------- #
@@ -154,6 +154,8 @@ else
 INDRA_PORT=$PORT
 INDRA_API_KEY=$KEY
 OCR_THREADS=$THREADS
+WORKER_CPUS=1.5
+WORKER_MEM=1g
 MIN_WORKERS=1
 MAX_WORKERS=$MAX_WORKERS
 MAX_QUEUE=1000
@@ -290,7 +292,7 @@ EOF
 # --------------------------------------------------------------------------- #
 if [ "$AUTOSCALE" = "ask" ]; then
     printf '\n'
-    if ask "是否开启自动伸缩？（默认 1 个 Worker，队列积压时自动加到 ${ENV_MAX} 个，空闲 2 分钟再减回 1 个）"; then
+    if ask "是否开启自动伸缩？（默认 1 个 Worker，队列积压时逐个加到 ${ENV_MAX} 个，空闲 90 秒再逐个减回 1 个）"; then
         AUTOSCALE="yes"
     else
         AUTOSCALE="no"

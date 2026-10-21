@@ -12,7 +12,7 @@ ENV PYTHONUNBUFFERED=1 \
     HF_HOME=/opt/models \
     HF_HUB_OFFLINE=1 \
     TMPDIR=/tmp/indra \
-    OCR_THREADS=8 \
+    OCR_THREADS=1 \
     REDIS_URL=redis://redis:6379/0
 
 WORKDIR /app

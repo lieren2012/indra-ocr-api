@@ -43,7 +43,9 @@ services:
     command: ["python", "worker.py"]
     environment:
       REDIS_URL: redis://redis:6379/0
-      OCR_THREADS: "${OCR_THREADS:-8}"      # 每个 worker 占用的线程/核数
+      # 每个 worker 的 onnxruntime 线程数。默认 1 = 一个 worker 只吃 1 个核，
+      # 靠"多开几个 worker"来扩吞吐（1 个不够就 2 个…默认最多 8 个）。
+      OCR_THREADS: "${OCR_THREADS:-1}"
       HF_HOME: /opt/models
       HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-1}"
       TMPDIR: /tmp/indra
@@ -61,13 +63,14 @@ services:
       retries: 3
       start_period: 90s
     # 默认只有 1 个 worker（不写死 replicas）。要更多副本可：
-    #   docker compose up -d --scale worker=4
-    # 或跑 scripts/autoscale.sh 按队列积压自动在 1~4 之间伸缩。
+    #   docker compose up -d --scale worker=8
+    # 或跑 scripts/autoscale.sh 按队列积压自动在 1~8 之间伸缩。
     deploy:
       resources:
         limits:
-          cpus: "8.0"                       # 每个副本限 8 核（= OCR_THREADS）
-          memory: 2G
+          # 单副本只跑 1 个线程，限 1.5 核足够（留点余量给解码/IO）
+          cpus: "${WORKER_CPUS:-1.5}"
+          memory: "${WORKER_MEM:-1g}"
     stop_grace_period: 300s                 # 长任务也能处理完再退出（配合优雅退出）
     restart: unless-stopped
 
