@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Indra OCR API 一键部署
+# Indra OCR API 一键部署（零配置：不填任何东西也能跑）
 # -----------------------------------------------------------------------------
-#   bash deploy.sh              # 交互式（推荐）
-#   bash deploy.sh -y           # 全部默认（不询问）
+#   bash deploy.sh                     # 推荐：全部默认 + 询问是否开伸缩
+#   bash deploy.sh -y                  # 全部默认，不询问
 #   bash deploy.sh -y --autoscale      # 部署完直接开自动伸缩
 #   bash deploy.sh -y --no-autoscale   # 部署完不开自动伸缩
-#   bash deploy.sh --port=9000         # 换端口
+#   bash deploy.sh --port=9000         # 指定端口（默认 8080，占用会自动顺延）
 #
-# 做的事：检查环境 → 生成 .env（随机密钥）→ 构建启动 → 等就绪 →
+# 做的事：检查环境 → 生成 .env（随机密钥 + 端口）→ 构建启动 → 等就绪 →
 #        打印访问地址/密钥/调用示例 → 询问是否开启自动伸缩。
 # =============================================================================
 set -uo pipefail
@@ -16,12 +16,13 @@ set -uo pipefail
 cd "$(dirname "$0")" || exit 1
 
 PORT=8080
+PORT_ARG=""                 # --port= 显式指定，优先级高于 .env
 ASSUME_YES=0
 AUTOSCALE="ask"
 WAIT_SECS="${WAIT_SECS:-300}"
 
 usage() {
-    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 for arg in "$@"; do
@@ -29,7 +30,7 @@ for arg in "$@"; do
         -y | --yes) ASSUME_YES=1 ;;
         --autoscale) AUTOSCALE="yes" ;;
         --no-autoscale) AUTOSCALE="no" ;;
-        --port=*) PORT="${arg#*=}" ;;
+        --port=*) PORT_ARG="${arg#*=}" ;;
         -h | --help) usage; exit 0 ;;
         *) echo "未知参数: $arg（--help 看用法）"; exit 1 ;;
     esac
@@ -65,6 +66,47 @@ gen_key() {
     else
         printf 'indra-%s-%s' "$(date +%s)" "$RANDOM$RANDOM"
     fi
+}
+
+port_in_use() {                           # 端口是否已被占用
+    local p="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}$" && return 0
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${p}$" && return 0
+    fi
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 1 bash -c "exec 3<>/dev/tcp/127.0.0.1/${p}" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+is_ours() {                               # 该端口上跑的是不是我们自己的服务
+    curl -fsS --max-time 2 "http://127.0.0.1:$1/readyz" 2>/dev/null |
+        grep -q '"active_workers"'
+}
+
+# 端口取值顺序：--port= > .env 的 INDRA_PORT > 默认 8080。
+# 空值 / 非数字 / 越界一律回到 8080；8080 被别的程序占了就自动顺延，
+# 不让"端口没填"或"端口被占"阻断部署。
+resolve_port() {
+    local p="$1" i=0
+    case "$p" in
+        '') : ;;
+        *[!0-9]*) warn "端口 \"$p\" 不是数字，改用默认 8080" >&2; p=8080 ;;
+    esac
+    p="${p:-8080}"
+    if [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
+        warn "端口 $p 超出 1–65535，改用默认 8080" >&2; p=8080
+    fi
+    while [ "$i" -lt 20 ]; do
+        if ! port_in_use "$p" || is_ours "$p"; then
+            printf '%s' "$p"; return 0
+        fi
+        warn "端口 $p 已被其他程序占用，自动顺延到 $((p + 1))" >&2
+        p=$((p + 1)); i=$((i + 1))
+    done
+    printf '%s' 8080
 }
 
 detect_ip() {                             # 取本机对外 IP（用于打印访问地址）
@@ -104,7 +146,7 @@ say "        （想改：编辑 .env 的 OCR_THREADS / MAX_WORKERS，再 docker 
 step "准备配置 .env"
 FRESH_ENV=0
 if [ -f .env ]; then
-    say "检测到已有 .env，沿用其中的密钥与端口（想换密钥：改 .env 后重跑本脚本）"
+    say "检测到已有 .env，直接沿用（不会覆盖你的密钥）"
 else
     KEY=$(gen_key)
     cat >.env <<EOF
@@ -119,13 +161,36 @@ JOB_TTL=86400
 EOF
     chmod 600 .env 2>/dev/null
     FRESH_ENV=1
-    say "已生成 .env（含随机 API Key）"
 fi
 
-# shellcheck disable=SC1091
-set -a; . ./.env; set +a          # 读回配置，后续提示用真实值
-PORT="${INDRA_PORT:-$PORT}"
-KEY="${INDRA_API_KEY:-}"
+# 读回配置：按行取值，不 source .env（避免密钥里的 $ # 空格被 shell 解释；
+# 同时 tr -d '\r' 去掉 Windows 记事本留下的回车，否则密钥末尾多个 \r 会鉴权失败）
+env_get() {
+    sed -n "s/^$1=//p" .env 2>/dev/null | tail -1 | tr -d '\r'
+}
+KEY="$(env_get INDRA_API_KEY)"
+# 伸缩上限以 .env 为准（autoscale.sh 读的就是它），没有才用按核数推荐的值
+ENV_MAX="$(env_get MAX_WORKERS)"
+ENV_MAX="${ENV_MAX:-$MAX_WORKERS}"
+
+# 端口优先级：--port= > .env 的 INDRA_PORT > 默认 8080（.env 里留空也算 8080）
+if [ -n "$PORT_ARG" ]; then
+    PORT="$PORT_ARG"
+else
+    PORT="$(env_get INDRA_PORT)"
+    PORT="${PORT:-8080}"
+fi
+
+# 不填就用 8080；最终值写回 .env，日后看配置就知道走哪个口
+PORT=$(resolve_port "$PORT")
+set_env INDRA_PORT "$PORT"
+
+if [ "$FRESH_ENV" = "1" ]; then
+    say "已生成 .env（端口 $PORT，随机 API Key）"
+else
+    say "沿用已有 .env 的密钥，端口 $PORT"
+fi
+say "        （想换端口：改 .env 的 INDRA_PORT 后重跑本脚本，或 --port=9000）"
 
 mkdir -p tmp redis-data
 
@@ -177,7 +242,7 @@ if [ "$READY" != "1" ]; then
     warn "等了 ${WAIT_SECS}s 还没就绪，最近的日志："
     docker compose ps
     docker compose logs --tail=30 worker 2>/dev/null
-    die "未就绪。常见原因：模型没下来（models/ 为空且无外网）、内存不足、端口 ${PORT} 被占用。"
+    die "未就绪。常见原因：模型没下来（models/ 为空且无外网）、内存不足、Docker 起不来（docker compose logs）。"
 fi
 
 # --------------------------------------------------------------------------- #
@@ -225,7 +290,7 @@ EOF
 # --------------------------------------------------------------------------- #
 if [ "$AUTOSCALE" = "ask" ]; then
     printf '\n'
-    if ask "是否开启自动伸缩？（默认 1 个 Worker，队列积压时自动加到 ${MAX_WORKERS} 个，空闲 2 分钟再减回 1 个）"; then
+    if ask "是否开启自动伸缩？（默认 1 个 Worker，队列积压时自动加到 ${ENV_MAX} 个，空闲 2 分钟再减回 1 个）"; then
         AUTOSCALE="yes"
     else
         AUTOSCALE="no"

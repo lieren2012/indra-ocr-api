@@ -37,7 +37,7 @@ Worker 池（加载模型，吃算力）：BLMOVE 取任务 → 跑 OCR → 结�
 
 | 项 | 默认 | 说明 / 怎么改 |
 |---|---|---|
-| **访问端口** `INDRA_PORT` | **8080** | `.env` 里改；对外就是 `http://<IP>:8080` |
+| **访问端口** `INDRA_PORT` | **8080** | 不填就是 8080；`.env` 里改最持久，`--port=N` 临时指定；被占用自动顺延并写回 `.env` |
 | **Worker 副本数** | **1** | compose 不写死 `replicas`；用 `--scale worker=N` 或 `scripts/autoscale.sh` 增减，**只动 worker** |
 | **每 Worker 线程数** `OCR_THREADS` | **8** | onnxruntime 线程数，≈ 该副本占用的核数；`deploy.sh` 会按核数自动推荐（≈ 核数/4，夹在 2–8） |
 | 单机总线程 | 副本数 × `OCR_THREADS` ≤ 物理核数 | 32 核 → 顶格 4 副本 × 8 线程；超了上下文切换反而掉速 |
@@ -119,10 +119,15 @@ bash deploy.sh
 
 脚本会依次做完这些事，**过程中会问你两个问题**：
 
+> **零配置**：什么都不填也能跑——端口默认 `8080`，密钥脚本自动生成。
+> 端口被别的程序占了会自动顺延到 8081/8082…，并把**实际端口写回 `.env`** 再打印给你，
+> 不会因为“端口没填”或“端口被占”导致部署失败。`.env` 里写成 `INDRA_PORT=`（留空）
+> 或写成非法值，都按 8080 处理。
+
 1. 检查 docker / compose / curl（不满足直接告诉你怎么装）
 2. 按 CPU 核数推荐「每个 Worker 线程数」和「最多几个 Worker」
    （8 核 → 2 线程 × 最多 4 个；32 核 → 8 线程 × 最多 4 个）
-3. **生成 `.env`，里面自动带一个 48 位随机 API Key**（权限 600）。已有 `.env` 就沿用，不会覆盖你的密钥
+3. **生成 `.env`，里面自动带一个 48 位随机 API Key 和端口**（权限 600）。已有 `.env` 就沿用，不会覆盖你的密钥
 4. 没有 `models/` 就问你**要不要联网下模型**（约 72MB）；有就按离线模式跑
 5. `docker compose up -d --build`，然后轮询 `/readyz` **等到真的有 Worker 在线**才算部署成功
 6. 打印并写进 `deploy-info.txt`：
@@ -137,6 +142,17 @@ bash deploy.sh
    - root 运行 → 装成 `indra-autoscale.service`，**重启后自动拉起**
    - 非 root → 后台 `nohup` 跑，并告诉你 PID 和日志位置
    - 选「否」也随时能开：`sudo bash deploy.sh -y --autoscale`
+
+#### 端口怎么定（优先级从高到低）
+
+| 来源 | 说明 |
+|---|---|
+| `bash deploy.sh --port=9000` | 命令行显式指定，优先级最高 |
+| `.env` 的 `INDRA_PORT` | 改这里最持久；留空等于 8080 |
+| 不配 | 默认 **8080** |
+| 被占用 | 自动 +1 顺延（最多试 20 个），结果写回 `.env`；如果占着的是**我们自己**已经在跑的服务，则保持不变，重复部署不会换口 |
+
+直接 `docker compose up -d`（不跑 `deploy.sh`）时，compose 里也是 `${INDRA_PORT:-8080}`，不建 `.env` 就是 8080。
 
 非交互（脚本/CI）用法：
 
@@ -334,7 +350,8 @@ curl "http://localhost:8080/v1/jobs/$JID?api_key=你的密钥"
 | Redis 掉电 / 内存满 | 已开 AOF（`everysec`，最多丢 ~1s）+ `noeviction`（写满返 503，**不淘汰任务**）；生产建议再加 Redis 主从/备份 |
 | Redis 是关键依赖 | 没有 Redis 整个服务不可用；务必开持久化 |
 | 自动伸缩不生效 | 确认 `autoscale.sh` 在**宿主机**、有 docker 权限；`journalctl -u indra-autoscale -f` 看是否有 `LLEN` 失败 |
-| 一键部署卡在"等待服务就绪" | 看 `docker compose logs --tail=50 worker`：最常见是 `models/` 为空又没外网（把 `.env` 的 `HF_HUB_OFFLINE` 改 0 联网下载，或预置模型）；其次是端口被占、内存不足 |
+| 一键部署卡在"等待服务就绪" | 看 `docker compose logs --tail=50 worker`：最常见是 `models/` 为空又没外网（把 `.env` 的 `HF_HUB_OFFLINE` 改 0 联网下载，或预置模型）；其次内存不足（`docker stats`） |
+| 端口 8080 被别的程序占了 | `deploy.sh` 会自动顺延到 8081+ 并写回 `.env`；手工部署则改 `INDRA_PORT` 后 `docker compose up -d` |
 
 ---
 
