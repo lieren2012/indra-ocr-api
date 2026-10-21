@@ -1,6 +1,6 @@
 # Indra OCR API 服务（Docker 部署 · v2.1 队列解耦 + 可靠队列 + 自动伸缩）
 
-> [Indra OCR](https://github.com/datalab-to/indra)（datalab-to 出品，纯 CPU 轻量 OCR）的 HTTP API 封装。FastAPI + Redis + Worker 队列，供知识库等系统调用。
+> [Indra OCR](https://github.com/datalab-to/indra)（datalab-to 出品，纯 CPU 轻量 OCR）的 HTTP API 封装。FastAPI + Redis 队列 + Worker 池：**API 收任务秒回、Worker 池异步 OCR**，**可靠队列不丢任务**、**按队列积压自动伸缩 1→4**，供知识库等系统调用，也适合任何人自部署。
 > **开源 · 可自部署**：任何人 `git clone` 本仓库即可跑自己的 OCR API，不依赖作者的服务；欢迎自建、二次开发与 PR。
 > **许可证**：本项目代码 Apache 2.0（见 `LICENSE`）；Indra 模型权重为修改版 OpenRAIL-M，商用前请阅 [条款](https://huggingface.co/datalab-to/indra-ocr)。
 > **实测吞吐**：单页 0.5–2.0s（纯 CPU，无需 GPU）。快速部署见 §3；离线模型预置见 `scripts/prepare_models.sh`。
