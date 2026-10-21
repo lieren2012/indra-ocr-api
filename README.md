@@ -1,4 +1,4 @@
-# Indra OCR API 服务（Docker 部署 · v2.0 队列解耦版）
+# Indra OCR API 服务（Docker 部署 · v2.1 队列解耦 + 可靠队列 + 自动伸缩）
 
 > [Indra OCR](https://github.com/datalab-to/indra)（datalab-to 出品，纯 CPU 轻量 OCR）的 HTTP API 封装。FastAPI + Redis + Worker 队列，供知识库等系统调用。
 > **开源 · 可自部署**：任何人 `git clone` 本仓库即可跑自己的 OCR API，不依赖作者的服务；欢迎自建、二次开发与 PR。
@@ -24,7 +24,7 @@ API   (极轻量，不加载模型)：收上传 → 落共享盘 → 写 Redis �
    │                                  ▲
    │ 队列 ocr:queue                   │ 结果写回任务哈希
    ▼                                  │
-Worker 池 (加载模型，吃算力)：BRPOP 取任务 → 跑 OCR → 存结果 → 删文件
+Worker 池 (加载模型，吃算力)：BLMOVE 取任务→跑 OCR→存结果→删文件（+ 独立心跳线程）
 ```
 
 **这套单机也能跑（比原来稳得多），要更高吞吐就加 Worker 副本 / 机器。**
@@ -37,14 +37,16 @@ Worker 池 (加载模型，吃算力)：BRPOP 取任务 → 跑 OCR → 存结�
 
 ```
 indra-ocr-service/
-├── api.py                  # API 服务（收任务、查状态、鉴权、背压）
-├── worker.py               # Worker（从队列取任务跑 OCR）
+├── api.py                  # API 服务（收任务、查状态、鉴权、背压、看门狗）
+├── worker.py               # Worker（可靠取任务、独立心跳、跑 OCR）
 ├── ocr_engine.py           # OCR 引擎封装（被 Worker 加载，模型常驻）
 ├── requirements.txt
 ├── Dockerfile              # 同一镜像，靠启动命令区分 api / worker
-├── docker-compose.yml      # redis + api + worker(replicas) + nginx
+├── docker-compose.yml      # redis + api + worker(默认1，可 --scale) + nginx
 ├── nginx.conf
-├── scripts/prepare_models.sh   # 联网机预置模型（只需跑一次）
+├── scripts/
+│   ├── prepare_models.sh   # 联网机预置模型（只需跑一次）
+│   └── autoscale.sh        # 宿主机自动伸缩（按队列积压 1→4，可选常驻）
 ├── models/                 # 离线模型（预置后挂载，~72MB）
 └── tmp/                    # 上传文件共享盘（api 写、worker 读，务必放数据盘）
 ```
@@ -74,12 +76,13 @@ cd indra-ocr-service
 # 公开部署务必设置 API Key（也可 cp .env.example .env 后编辑 .env）
 export INDRA_API_KEY="你的密钥"
 
-# 构建并启动（redis + api + 4 个 worker + nginx）
+# 构建并启动（redis + api + 1 个 worker + nginx；默认 1 个，按需扩容见 §4）
 docker compose up -d --build
 
-# 健康检查
-curl http://localhost:8080/healthz
-# 期望: {"ok":true,"redis":true,"active_workers":4,"queued":0,...}
+# 就绪检查（注意：/healthz 的 ok 字段只有在有在线 worker 时才为 true）
+curl http://localhost:8080/readyz
+# 期望: {"ok":true,"redis":true,"active_workers":1,"queued":0,...}
+#       worker 数为 0 时返回 HTTP 503 —— 部署验收请看 /readyz，别只看进程起来
 ```
 
 **磁盘注意**：Docker 默认 `data-root` 在 `/var/lib/docker`（根分区）。
@@ -89,14 +92,38 @@ curl http://localhost:8080/healthz
 
 ## 4. 横向扩容（应对高吞吐）
 
-吞吐瓶颈在 **Worker 算力**，不在 API/Redis。扩容只看 Worker：
+吞吐瓶颈在 **Worker 算力**，不在 API/Redis。扩容只看 Worker。
 
-- **同机多副本**：`docker compose up -d --scale worker=N`（N = floor(机器核数 / OCR_THREADS)）。
-  例：32 核、`OCR_THREADS=8` → 同时跑 4 个 Worker 副本。
-- **跨机集群**：在更多机器上跑 Worker 容器，指向**同一个 Redis**（Redis 部署在内网可达处；文件共享盘换成对象存储 / NFS）。
-  API 是无状态的，也可多机部署在 Redis 前。
-- **队列做天然背压**：突发洪峰时任务在 Redis 里堆积，API 照常秒回 `job_id`；队列超过 `MAX_QUEUE`（默认 1000）才对客户端返回 `429`，保护系统不被冲垮。
+> **默认只跑 1 个 Worker**（省内存）。Docker Compose 的副本数是启动时固定的，
+> **原生不支持按负载自动伸缩**；下面两种方式补上这件事。
 
+**方式 A：手动扩容**
+
+```bash
+docker compose up -d --scale worker=4     # 4 个副本（N = floor(核数 / OCR_THREADS)）
+```
+
+**方式 B：自动伸缩（推荐，按队列积压 1→4）**
+
+`scripts/autoscale.sh` 在**宿主机**轮询 Redis 队列长度，积压就 +1、空闲 120s 就 -1，范围 1–4：
+
+```bash
+# 前台运行
+bash scripts/autoscale.sh
+# 后台常驻
+nohup bash scripts/autoscale.sh >/var/log/indra-autoscale.log 2>&1 &
+```
+
+可调环境变量：`MIN_WORKERS=1 MAX_WORKERS=4 INTERVAL=5 IDLE_SECS=120`。
+它只 `--scale worker`，不会重建 api / redis。
+（真正的按需弹性若要更精细，上 K8s + HPA/KEDA 按 Redis 队列长度扩副本。）
+
+**方式 C：跨机集群**
+
+在更多机器上跑 Worker 容器，指向**同一个 Redis**（Redis 部署在内网可达处；文件共享盘换成对象存储 / NFS）。
+API 是无状态的，也可多机部署在 Redis 前。
+
+> 队列是天然背压：洪峰时任务在 Redis 堆积、API 照常秒回 `job_id`；超过 `MAX_QUEUE`（默认 1000）才返回 `429`。
 > Worker 副本数 × `OCR_THREADS` 不应超过机器总核数，否则上下文切换反而掉速。
 
 ---
@@ -131,7 +158,8 @@ curl "http://localhost:8080/v1/jobs/$JID?api_key=你的密钥"
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| GET | `/healthz` | 健康检查（Redis 连通、在线 Worker 数、排队数） |
+| GET | `/healthz` | 存活检查（始终 200；`ok` 字段 = Redis 通 且 在线 Worker > 0） |
+| GET | `/readyz` | 就绪检查（无在线 Worker 时返回 **503**；部署验收看这个） |
 | POST | `/v1/jobs` | 提交任务（multipart: `file`, `max_pages=0` 不限）→ 返回 `job_id` |
 | GET | `/v1/jobs/{id}` | 查询状态/结果（`pending`/`processing`/`done`/`error`） |
 
@@ -145,9 +173,10 @@ curl "http://localhost:8080/v1/jobs/$JID?api_key=你的密钥"
 1. **临时文件清理**：Worker 处理完即删；另加 cron 兜底删 1 小时前的文件：
    `0 * * * * find /www/indra/tmp -type f -mmin +60 -delete`
 2. **Redis 容量**：任务完成保留 24h（`JOB_TTL`）后自动过期；Redis 配了 `maxmemory 1gb + allkeys-lru` 兜底，不会撑爆。
-3. **监控**：`/healthz` 探活 + `active_workers` / `queued`；Worker 心跳 TTL 30s，进程挂了会被探活发现。
-4. **扩容/缩容**：调 `worker` 副本数即可，API 与 Redis 不动。
-5. **合规**：Indra 权重为修改版 OpenRAIL-M，营收 >2000 万美元或与 Datalab API 竞争不可用，部署前确认。
+3. **监控**：`/readyz` 做验收（无在线 Worker 直接 503），`/healthz` 看 `active_workers` / `queued`。Worker 心跳由**独立线程**每 15s 刷新、TTL 60s，**长文档处理期间也不会误判离线**；进程真挂了约 60s 内被发现。
+4. **不丢任务**：可靠队列 —— 任务先 `BLMOVE` 原子挪到 `ocr:processing:{worker}`，成功才 `LREM`；API 内置**看门狗**每 30s 扫描，把心跳过期的死 Worker 的 processing 列表**重新入队**。
+5. **扩容/缩容**：`--scale worker=N` 或 `scripts/autoscale.sh`（自动 1→4），API 与 Redis 不动。
+6. **合规**：Indra 权重为修改版 OpenRAIL-M，营收 >2000 万美元或与 Datalab API 竞争不可用，部署前确认。
 
 ---
 
@@ -157,7 +186,7 @@ curl "http://localhost:8080/v1/jobs/$JID?api_key=你的密钥"
 |---|---|
 | 中文路径崩溃 | 任务文件用 `uuid4().hex` 纯 ASCII 文件名；**且 `TMPDIR` 目录路径本身也不能含中文**（cv2.imread 连中文目录路径也读不了，会 500） |
 | 内网无法下载模型 | 预置 `HF_HOME` + `HF_HUB_OFFLINE=1` |
-| Worker 重启丢进行中任务 | 任务文件落在共享盘，重启后文件仍在但任务状态可能停在 pending；Worker 取到后会重新处理（幂等），结果以最终为准 |
+| Worker 崩溃/重启丢任务 | 已用可靠队列兜住：任务在处理列表中，看门狗约 60s 后自动重新入队；极端情况（OCR 完成但没来得及落库就崩溃）会**重复处理一次**，结果以最终为准（幂等） |
 | 根分区被 Docker 写满 | data-root / 临时目录迁到数据盘 |
 | Redis 是关键依赖 | 没有 Redis 整个服务不可用；生产建议 Redis 持久化 + 主从 |
 

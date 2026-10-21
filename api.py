@@ -1,15 +1,15 @@
 """
-Indra OCR API 服务（v2.0 —— 队列解耦版）
+Indra OCR API 服务（v2.1 —— 队列解耦 + 可靠队列 + 看门狗）
 
 职责（极轻量，不加载 OCR 模型）：
   - 接收上传 → 落盘到共享 tmp → 写 Redis 任务哈希 + 入队 → 立即返回 job_id
   - 提供任务状态/结果查询
   - 鉴权（按 API Key）+ 背压（队列过长直接 429，保护系统）
-
-OCR 计算完全在 Worker 里跑，本服务不受 OCR 阻塞，可自由横向扩副本。
+  - 后台看门狗：把"已取出但 Worker 已死"的任务重新入队，避免丢任务
 
 接口：
-  GET  /healthz             健康检查（Redis 连通性、在线 Worker 数、排队数）
+  GET  /healthz             存活检查（Redis 连通 + 在线 Worker 数，ok 字段如实反映）
+  GET  /readyz              就绪检查（Redis 连通且至少 1 个 Worker，否则 503）
   POST /v1/jobs             提交任务（multipart: file, max_pages=0 不限）
   GET  /v1/jobs/{job_id}    查询状态/结果（pending/processing/done/error）
 
@@ -18,18 +18,20 @@ OCR 计算完全在 Worker 里跑，本服务不受 OCR 阻塞，可自由横向
   INDRA_API_KEY    非空则启用鉴权（请求头 X-API-Key 或 ?api_key=）
   TMPDIR           上传文件落盘目录（默认 /tmp/indra，须为 API 与 Worker 共享卷）
   MAX_QUEUE        队列上限，超过返回 429（默认 1000）
+  JOB_TTL          任务完成后结果保留秒数（默认 86400）
 """
 
 from __future__ import annotations
 
+import json
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
 
 import redis
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
-from fastapi import Header
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 
 # --------------------------------------------------------------------------- #
 # 配置
@@ -38,13 +40,99 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 INDRA_API_KEY = os.getenv("INDRA_API_KEY", "")        # 空字符串 = 不鉴权
 TMPDIR = os.getenv("TMPDIR", "/tmp/indra")
 MAX_QUEUE = int(os.getenv("MAX_QUEUE", "1000"))
+JOB_TTL = int(os.getenv("JOB_TTL", "86400"))
+
 QUEUE = "ocr:queue"
-JOB_TTL = int(os.getenv("JOB_TTL", "86400"))          # 任务完成后再保留 24h
+WORKERS_SET = "ocr:workers"          # 所有注册过的 worker id（持久集合）
+REAPER_LOCK = "ocr:reaper:lock"      # 看门狗互斥锁（多 API 副本时只让一个干活）
+REAPER_INTERVAL = int(os.getenv("REAPER_INTERVAL", "30"))
 
 Path(TMPDIR).mkdir(parents=True, exist_ok=True)
 
 r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-app = FastAPI(title="Indra OCR API", version="2.0.0")
+app = FastAPI(title="Indra OCR API", version="2.1.0")
+
+
+# --------------------------------------------------------------------------- #
+# 健康 / 就绪
+# --------------------------------------------------------------------------- #
+def _snapshot() -> dict:
+    redis_ok = True
+    try:
+        r.ping()
+    except Exception:
+        redis_ok = False
+
+    workers = -1
+    queued = -1
+    if redis_ok:
+        try:
+            workers = len(r.keys("ocr:worker:*"))   # 只统计未过期的在线心跳
+            queued = r.llen(QUEUE)
+        except Exception:
+            pass
+
+    # ok 必须同时满足：Redis 通 + 至少 1 个在线 Worker
+    ok = redis_ok and workers > 0
+    return {
+        "ok": ok,
+        "redis": redis_ok,
+        "active_workers": workers,
+        "queued": queued,
+        "max_queue": MAX_QUEUE,
+    }
+
+
+@app.get("/healthz")
+def healthz() -> dict:
+    # 存活探针：始终 200，但 ok 字段如实反映能否真正处理任务（worker=0 → false）
+    return _snapshot()
+
+
+@app.get("/readyz")
+def readyz() -> dict:
+    snap = _snapshot()
+    if not snap["ok"]:
+        raise HTTPException(status_code=503, detail=snap)
+    return snap
+
+
+# --------------------------------------------------------------------------- #
+# 看门狗：把死掉 Worker 的 processing 列表重新入队，避免丢任务
+# --------------------------------------------------------------------------- #
+def _reap_once() -> None:
+    # 多 API 副本时用 Redis 锁保证同一时刻只有一个在看门
+    if not r.set(REAPER_LOCK, "1", nx=True, ex=25):
+        return
+    try:
+        for wid in list(r.smembers(WORKERS_SET)):
+            if r.exists(f"ocr:worker:{wid}"):
+                continue  # 心跳还在 → 活着，跳过
+            plist = f"ocr:processing:{wid}"
+            jobs = r.lrange(plist, 0, -1)
+            if jobs:
+                r.rpush(QUEUE, *jobs)                    # 重新入队
+                for jid in jobs:
+                    r.hset(f"ocr:job:{jid}", "status", "pending")
+                    r.hdel(f"ocr:job:{jid}", "processing_since")
+                r.delete(plist)
+            r.srem(WORKERS_SET, wid)
+    finally:
+        r.delete(REAPER_LOCK)
+
+
+def _reaper_loop() -> None:
+    while True:
+        time.sleep(REAPER_INTERVAL)
+        try:
+            _reap_once()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[reaper] error: {exc}", flush=True)
+
+
+@app.on_event("startup")
+def _startup() -> None:
+    threading.Thread(target=_reaper_loop, daemon=True).start()
 
 
 # --------------------------------------------------------------------------- #
@@ -58,33 +146,6 @@ def require_auth(
         return
     if (x_api_key or api_key) != INDRA_API_KEY:
         raise HTTPException(status_code=401, detail="invalid api key")
-
-
-# --------------------------------------------------------------------------- #
-# 健康检查
-# --------------------------------------------------------------------------- #
-@app.get("/healthz")
-def healthz() -> dict:
-    try:
-        r.ping()
-        redis_ok = True
-    except Exception:
-        redis_ok = False
-    workers = 0
-    queued = -1
-    if redis_ok:
-        try:
-            workers = len(r.keys("ocr:worker:*"))
-            queued = r.llen(QUEUE)
-        except Exception:
-            pass
-    return {
-        "ok": redis_ok,
-        "redis": redis_ok,
-        "active_workers": workers,
-        "queued": queued,
-        "max_queue": MAX_QUEUE,
-    }
 
 
 # --------------------------------------------------------------------------- #
@@ -140,13 +201,9 @@ def get_job(
     status = data.get("status")
     resp: dict = {"job_id": job_id, "status": status}
     if status == "done":
-        import json
-
         resp["result"] = json.loads(data.get("result", "{}"))
         if data.get("elapse"):
             resp["elapse"] = float(data["elapse"])
     elif status == "error":
         resp["error"] = data.get("error")
-    elif status == "processing":
-        resp["queue_position"] = None
     return resp

@@ -13,7 +13,7 @@ services:
 
   api:
     build: .
-    image: indra-ocr:2.0.0
+    image: indra-ocr:2.1.0
     environment:
       REDIS_URL: redis://redis:6379/0
       INDRA_API_KEY: "${INDRA_API_KEY:-}"   # 空=不鉴权；公开部署务必设置
@@ -35,7 +35,7 @@ services:
 
   worker:
     build: .
-    image: indra-ocr:2.0.0
+    image: indra-ocr:2.1.0
     command: ["python", "worker.py"]
     environment:
       REDIS_URL: redis://redis:6379/0
@@ -49,14 +49,15 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    # 横向扩容：replicas = floor(机器核数 / OCR_THREADS)
-    # 例：32 核 / OCR_THREADS=8 → 4 个 worker 副本
+    # 默认只有 1 个 worker（不写死 replicas）。要更多副本可：
+    #   docker compose up -d --scale worker=4
+    # 或跑 scripts/autoscale.sh 按队列积压自动在 1~4 之间伸缩。
     deploy:
-      replicas: 4
       resources:
         limits:
           cpus: "8.0"                       # 每个副本限 8 核（= OCR_THREADS）
           memory: 2G
+    stop_grace_period: 300s                 # 长任务也能处理完再退出（配合优雅退出）
     restart: unless-stopped
 
   nginx:
