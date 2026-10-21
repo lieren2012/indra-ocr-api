@@ -1,0 +1,9 @@
+# 统一按 LF 存进仓库：Windows 上编辑脚本若带 CRLF，Linux 侧会报
+# $'\r': command not found，直接在部署机上炸。
+* text=auto eol=lf
+*.sh   text eol=lf
+*.py   text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+*.png  binary
+*.pdf  binary

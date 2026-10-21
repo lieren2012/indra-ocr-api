@@ -1,5 +1,5 @@
 """
-Indra OCR API 服务（v2.1 —— 队列解耦 + 可靠队列 + 看门狗）
+Indra OCR API 服务（v2.2 —— 队列解耦 + 可靠队列 + 看门狗）
 
 职责（极轻量，不加载 OCR 模型）：
   - 接收上传 → 落盘到共享 tmp → 写 Redis 任务哈希 + 入队 → 立即返回 job_id
@@ -50,7 +50,7 @@ REAPER_INTERVAL = int(os.getenv("REAPER_INTERVAL", "30"))
 Path(TMPDIR).mkdir(parents=True, exist_ok=True)
 
 r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-app = FastAPI(title="Indra OCR API", version="2.1.0")
+app = FastAPI(title="Indra OCR API", version="2.2.0")
 
 
 # --------------------------------------------------------------------------- #

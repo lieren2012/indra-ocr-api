@@ -15,7 +15,7 @@ services:
 
   api:
     build: .
-    image: indra-ocr:2.1.0
+    image: indra-ocr:2.2.0
     environment:
       REDIS_URL: redis://redis:6379/0
       INDRA_API_KEY: "${INDRA_API_KEY:-}"   # 空=不鉴权；公开部署务必设置
@@ -39,7 +39,7 @@ services:
 
   worker:
     build: .
-    image: indra-ocr:2.1.0
+    image: indra-ocr:2.2.0
     command: ["python", "worker.py"]
     environment:
       REDIS_URL: redis://redis:6379/0

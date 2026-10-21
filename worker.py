@@ -1,5 +1,5 @@
 """
-Indra OCR Worker（v2.1 —— 可靠队列 + 独立心跳）
+Indra OCR Worker（v2.2 —— 可靠队列 + 独立心跳 + 失败自动重投）
 
 职责（重，加载模型、吃 OCR 算力）：
   - 注册：把自己的 id 写入 Redis 集合 `ocr:workers`（供 API 看门狗识别死活）
@@ -74,27 +74,81 @@ def _heartbeat_loop() -> None:
         _stop.wait(HB_REFRESH)
 
 
-def _finalize(job_key: str, jid: str, path: "str | None", mapping: dict) -> bool:
-    """把终态写入 Redis；**只有落库成功**才移除 processing 记录并删文件。
+# 结果写不进 Redis 时，把任务从 processing **原子** 搬回队列（重投）。
+# RPUSH 在前、LREM 在后：若 RPUSH 失败则整个脚本报错、LREM 不执行，
+# 任务仍安全留在 processing，绝不会出现"既不在队列也不在 processing"的丢失。
+_REQUEUE_LUA = """
+redis.call('RPUSH', KEYS[2], ARGV[1])
+redis.call('LREM', KEYS[1], 1, ARGV[1])
+return 1
+"""
 
-    顺序严格为：落库 → 移出 processing → 删文件。
-    - 落库失败：直接返回 False，不删文件、不移出 processing（交给看门狗稍后重投），绝不丢任务。
-    - 落库成功但删文件失败：只是留下垃圾文件（cron 兜底清理），任务结果已安全。
+
+def _try_lrem(jid: str, delete_path: "str | None" = None) -> None:
+    """尝试把任务移出 processing；**仅在确实移除成功时**才删文件。"""
+    try:
+        removed = r.lrem(PROC_LIST, 1, jid)
+    except Exception:
+        return
+    if removed and delete_path:
+        try:
+            if os.path.exists(delete_path):
+                os.remove(delete_path)
+        except OSError:
+            pass
+
+
+def _requeue(job_id: str) -> None:
+    """结果写不进 Redis 时主动重投，避免任务卡在本 worker 手里永远不重试。
+    重投也失败 → 结束本进程，让心跳过期、由看门狗兜底回收。"""
+    for _ in range(3):
+        try:
+            r.eval(_REQUEUE_LUA, 2, PROC_LIST, QUEUE, job_id)
+        except Exception:
+            time.sleep(0.5)
+            continue
+        try:
+            r.hset(f"ocr:job:{job_id}", "status", "pending")
+            r.hdel(f"ocr:job:{job_id}", "processing_since")
+        except Exception:
+            pass
+        return
+    print(
+        f"[worker {WORKER_ID}] FATAL: cannot persist nor requeue job {job_id}; "
+        f"exiting so reaper recovers it after heartbeat TTL",
+        flush=True,
+    )
+    os._exit(2)
+
+
+def _finalize(job_key: str, jid: str, path: "str | None", mapping: dict) -> bool:
+    """把终态写入 Redis；返回是否落库成功。
+
+    顺序：落库(重试3次) → LREM → **仅当 LREM 确实移除成功才**删文件。
+    - 落库失败：返回 False（保留文件与 processing 记录），由调用方 _requeue。
+    - LREM 失败/未移除：**保留文件** —— 否则任务日后被重投时会因"文件不存在"报错，
+      并覆盖掉原本成功的结果。
     """
+    for _ in range(3):
+        try:
+            r.hset(job_key, mapping=mapping)
+            r.expire(job_key, JOB_TTL)
+            break
+        except Exception:
+            time.sleep(0.5)
+    else:
+        return False  # 落库失败
+
     try:
-        r.hset(job_key, mapping=mapping)
-        r.expire(job_key, JOB_TTL)
+        removed = r.lrem(PROC_LIST, 1, jid)
     except Exception:
-        return False  # 落库失败 —— 保留一切，等重投
-    try:
-        r.lrem(PROC_LIST, 1, jid)
-    except Exception:
-        pass
-    try:
-        if path and os.path.exists(path):
-            os.remove(path)
-    except OSError:
-        pass
+        return True  # 落库成功但无法确认移除：保留文件，绝不删
+    if removed:  # 确认已移出 processing，才安全删文件
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
     return True
 
 
@@ -106,10 +160,12 @@ def process(job_id: str) -> None:
         return  # 读不到 → 保留在 processing，看门狗会重投
 
     if not job:
-        try:
-            r.lrem(PROC_LIST, 1, job_id)
-        except Exception:
-            pass
+        _try_lrem(job_id)
+        return
+
+    # 已经成功过（上次落库后没来得及移出就被重投）：只清理，不重算、绝不改成 error
+    if job.get("status") == "done":
+        _try_lrem(job_id, os.path.join(TMPDIR, job_id + job.get("suffix", ".png")))
         return
 
     suffix = job.get("suffix", ".png")
@@ -117,7 +173,8 @@ def process(job_id: str) -> None:
     path = os.path.join(TMPDIR, job_id + suffix)
 
     if not os.path.exists(path):
-        _finalize(job_key, job_id, None, {"status": "error", "error": "file missing (worker restarted?)"})
+        if not _finalize(job_key, job_id, None, {"status": "error", "error": "file missing (worker restarted?)"}):
+            _requeue(job_id)
         return
 
     try:
@@ -126,11 +183,12 @@ def process(job_id: str) -> None:
         result = ocr_engine.run_ocr(path, max_pages)
         elapse = round(time.time() - t0, 3)
     except Exception as exc:  # noqa: BLE001
-        _finalize(job_key, job_id, path, {"status": "error", "error": str(exc)})
+        if not _finalize(job_key, job_id, path, {"status": "error", "error": str(exc)}):
+            _requeue(job_id)  # 连 error 都写不进 Redis → 重投，别让任务卡死
         return
 
-    # OCR 成功：落库失败则留在 processing（不删文件），由看门狗稍后重投，绝不丢
-    _finalize(
+    # OCR 成功：落库失败 → 重投（而不是留在 processing 里卡死）
+    ok = _finalize(
         job_key,
         job_id,
         path,
@@ -140,6 +198,8 @@ def process(job_id: str) -> None:
             "elapse": str(elapse),
         },
     )
+    if not ok:
+        _requeue(job_id)
 
 
 def _cleanup() -> None:
