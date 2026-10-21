@@ -1,7 +1,9 @@
 services:
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--save", "300", "1", "--maxmemory", "1gb", "--maxmemory-policy", "allkeys-lru"]
+    # AOF 每秒落盘（掉电最多丢 ~1s 写入）+ noeviction：
+    # 内存满时"写失败而非淘汰队列/任务/心跳"，API 会返回 503 让调用方重试，绝不静默丢数据。
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--save", "900", "1", "--maxmemory", "1gb", "--maxmemory-policy", "noeviction"]
     volumes:
       - ./redis-data:/data
     restart: unless-stopped
@@ -27,10 +29,12 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      # 用 /readyz 而非 /healthz：无在线 worker 时返回 503 → Docker 不会显示"假健康"
+      test: ["CMD", "curl", "-f", "http://localhost:8000/readyz"]
       interval: 30s
       timeout: 5s
       retries: 3
+      start_period: 30s
     restart: unless-stopped
 
   worker:
@@ -49,6 +53,13 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    healthcheck:
+      # 校验本 worker 自己的心跳：模型没加载好 / 进程卡死 → 心跳缺失 → unhealthy
+      test: ["CMD", "python", "worker_healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
     # 默认只有 1 个 worker（不写死 replicas）。要更多副本可：
     #   docker compose up -d --scale worker=4
     # 或跑 scripts/autoscale.sh 按队列积压自动在 1~4 之间伸缩。

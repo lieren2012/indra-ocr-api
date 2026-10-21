@@ -45,6 +45,8 @@ HB_REFRESH = int(os.getenv("WORKER_HEARTBEAT_REFRESH", "15"))
 
 QUEUE = "ocr:queue"
 WORKERS_SET = "ocr:workers"
+# 容器内专属路径（/tmp 非共享卷），供 healthcheck 校验本 worker 心跳
+WORKER_ID_FILE = "/tmp/india_worker_id"
 
 WORKER_ID = uuid.uuid4().hex
 HEARTBEAT_KEY = f"ocr:worker:{WORKER_ID}"
@@ -72,11 +74,42 @@ def _heartbeat_loop() -> None:
         _stop.wait(HB_REFRESH)
 
 
+def _finalize(job_key: str, jid: str, path: "str | None", mapping: dict) -> bool:
+    """把终态写入 Redis；**只有落库成功**才移除 processing 记录并删文件。
+
+    顺序严格为：落库 → 移出 processing → 删文件。
+    - 落库失败：直接返回 False，不删文件、不移出 processing（交给看门狗稍后重投），绝不丢任务。
+    - 落库成功但删文件失败：只是留下垃圾文件（cron 兜底清理），任务结果已安全。
+    """
+    try:
+        r.hset(job_key, mapping=mapping)
+        r.expire(job_key, JOB_TTL)
+    except Exception:
+        return False  # 落库失败 —— 保留一切，等重投
+    try:
+        r.lrem(PROC_LIST, 1, jid)
+    except Exception:
+        pass
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+    return True
+
+
 def process(job_id: str) -> None:
     job_key = f"ocr:job:{job_id}"
-    job = r.hgetall(job_key)
+    try:
+        job = r.hgetall(job_key)
+    except Exception:
+        return  # 读不到 → 保留在 processing，看门狗会重投
+
     if not job:
-        r.lrem(PROC_LIST, 1, job_id)
+        try:
+            r.lrem(PROC_LIST, 1, job_id)
+        except Exception:
+            pass
         return
 
     suffix = job.get("suffix", ".png")
@@ -84,9 +117,7 @@ def process(job_id: str) -> None:
     path = os.path.join(TMPDIR, job_id + suffix)
 
     if not os.path.exists(path):
-        r.hset(job_key, mapping={"status": "error", "error": "file missing (worker restarted?)"})
-        r.expire(job_key, JOB_TTL)
-        r.lrem(PROC_LIST, 1, job_id)
+        _finalize(job_key, job_id, None, {"status": "error", "error": "file missing (worker restarted?)"})
         return
 
     try:
@@ -94,33 +125,21 @@ def process(job_id: str) -> None:
         t0 = time.time()
         result = ocr_engine.run_ocr(path, max_pages)
         elapse = round(time.time() - t0, 3)
-        r.hset(
-            job_key,
-            mapping={
-                "status": "done",
-                "result": json.dumps(result, ensure_ascii=False),
-                "elapse": str(elapse),
-            },
-        )
-        r.expire(job_key, JOB_TTL)
-        try:
-            os.remove(path)
-        except OSError:
-            pass
     except Exception as exc:  # noqa: BLE001
-        try:
-            r.hset(job_key, mapping={"status": "error", "error": str(exc)})
-            r.expire(job_key, JOB_TTL)
-        except Exception:
-            pass
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-        except OSError:
-            pass
-    finally:
-        # 只有成功/失败都已落库后才从 processing 列表移除；崩溃则留给看门狗回收
-        r.lrem(PROC_LIST, 1, job_id)
+        _finalize(job_key, job_id, path, {"status": "error", "error": str(exc)})
+        return
+
+    # OCR 成功：落库失败则留在 processing（不删文件），由看门狗稍后重投，绝不丢
+    _finalize(
+        job_key,
+        job_id,
+        path,
+        {
+            "status": "done",
+            "result": json.dumps(result, ensure_ascii=False),
+            "elapse": str(elapse),
+        },
+    )
 
 
 def _cleanup() -> None:
@@ -140,16 +159,26 @@ def _cleanup() -> None:
 
 
 def main() -> None:
-    # 先注册 + 首次心跳，再启动心跳线程（避免"在集合里但没心跳"的窗口）
+    # ★ 先加载模型：模型真正就绪之后才注册 + 发心跳。
+    #   否则 /readyz 会在模型还在加载时就误报"有 worker 就绪"。
+    #   若加载失败，本进程直接退出（未注册、无心跳），/readyz 会如实返回 503。
+    ocr_engine.load_model(OCR_THREADS)
+    print(f"[worker {WORKER_ID}] model loaded, threads={OCR_THREADS}", flush=True)
+
+    # 写容器专属 worker_id（/tmp 非共享卷，供 healthcheck 校验自身心跳）
+    try:
+        with open(WORKER_ID_FILE, "w", encoding="utf-8") as f:
+            f.write(WORKER_ID)
+    except OSError:
+        pass
+
+    # 模型就绪后再注册 + 首次心跳，然后启动独立心跳线程
     try:
         r.set(HEARTBEAT_KEY, str(time.time()), ex=HB_TTL)
         r.sadd(WORKERS_SET, WORKER_ID)
     except Exception:
         pass
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
-
-    ocr_engine.load_model(OCR_THREADS)
-    print(f"[worker {WORKER_ID}] model loaded, threads={OCR_THREADS}", flush=True)
 
     while not _stop.is_set():
         try:

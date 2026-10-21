@@ -22,6 +22,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 同一镜像同时承载 API 与 Worker，靠启动命令区分
 COPY ocr_engine.py api.py worker.py ./
+COPY scripts/worker_healthcheck.py ./worker_healthcheck.py
 
 EXPOSE 8000
 

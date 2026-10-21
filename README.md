@@ -172,9 +172,9 @@ curl "http://localhost:8080/v1/jobs/$JID?api_key=你的密钥"
 
 1. **临时文件清理**：Worker 处理完即删；另加 cron 兜底删 1 小时前的文件：
    `0 * * * * find /www/indra/tmp -type f -mmin +60 -delete`
-2. **Redis 容量**：任务完成保留 24h（`JOB_TTL`）后自动过期；Redis 配了 `maxmemory 1gb + allkeys-lru` 兜底，不会撑爆。
-3. **监控**：`/readyz` 做验收（无在线 Worker 直接 503），`/healthz` 看 `active_workers` / `queued`。Worker 心跳由**独立线程**每 15s 刷新、TTL 60s，**长文档处理期间也不会误判离线**；进程真挂了约 60s 内被发现。
-4. **不丢任务**：可靠队列 —— 任务先 `BLMOVE` 原子挪到 `ocr:processing:{worker}`，成功才 `LREM`；API 内置**看门狗**每 30s 扫描，把心跳过期的死 Worker 的 processing 列表**重新入队**。
+2. **Redis 持久化 + 不淘汰**：开启 **AOF**（`appendfsync everysec`，掉电最多丢 ~1s 写入）；**`noeviction`**（内存满时**写失败而非淘汰队列/任务/心跳**，API 返回 503 让调用方重试，绝不静默丢数据）；结果保留 24h（`JOB_TTL`）后自动过期。
+3. **监控**：`/readyz` 做验收（无在线 Worker 直接 503），`/healthz` 看 `active_workers` / `queued`。Worker 心跳由**独立线程**每 15s 刷新、TTL 60s，**长文档处理期间也不会误判离线**；进程真挂了约 60s 内被发现。Compose 健康检查：**api 用 `/readyz`、worker 用自身心跳**，`docker compose ps` 能看到真实健康态，不再是"进程活着=健康"的假象。
+4. **不丢任务**：可靠队列 —— 任务先 `BLMOVE` 原子挪到 `ocr:processing:{worker}`，**结果成功落库才** `LREM` + 删文件（落库失败一律保留、绝不删）；API 内置**看门狗**每 30s 扫描，用**原子 Lua 脚本**把心跳过期的死 Worker 的 processing 列表整体重投回队列，不会产生重复任务。
 5. **扩容/缩容**：`--scale worker=N` 或 `scripts/autoscale.sh`（自动 1→4），API 与 Redis 不动。
 6. **合规**：Indra 权重为修改版 OpenRAIL-M，营收 >2000 万美元或与 Datalab API 竞争不可用，部署前确认。
 
@@ -188,7 +188,8 @@ curl "http://localhost:8080/v1/jobs/$JID?api_key=你的密钥"
 | 内网无法下载模型 | 预置 `HF_HOME` + `HF_HUB_OFFLINE=1` |
 | Worker 崩溃/重启丢任务 | 已用可靠队列兜住：任务在处理列表中，看门狗约 60s 后自动重新入队；极端情况（OCR 完成但没来得及落库就崩溃）会**重复处理一次**，结果以最终为准（幂等） |
 | 根分区被 Docker 写满 | data-root / 临时目录迁到数据盘 |
-| Redis 是关键依赖 | 没有 Redis 整个服务不可用；生产建议 Redis 持久化 + 主从 |
+| Redis 掉电 / 内存满 | 已开 AOF（`everysec`，最多丢 ~1s）+ `noeviction`（写满返 503，**不淘汰任务**）；生产建议再加 Redis 主从/备份 |
+| Redis 是关键依赖 | 没有 Redis 整个服务不可用；务必开持久化 |
 
 ---
 

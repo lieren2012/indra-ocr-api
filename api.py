@@ -100,25 +100,51 @@ def readyz() -> dict:
 # --------------------------------------------------------------------------- #
 # 看门狗：把死掉 Worker 的 processing 列表重新入队，避免丢任务
 # --------------------------------------------------------------------------- #
+# 原子地把某个死 worker 的 processing 列表整体挪回队列：
+# LMOVE 逐个搬本身是原子的，整个 Lua 脚本又在 Redis 内单线程执行，
+# 因此不存在"搬了一半"的中间可见状态，也就不会产生重复任务。
+_REAP_LUA = """
+local plist = KEYS[1]
+local queue = KEYS[2]
+local ids = {}
+while true do
+  local jid = redis.call('LMOVE', plist, queue, 'RIGHT', 'LEFT')
+  if not jid then break end
+  ids[#ids+1] = jid
+end
+return ids
+"""
+
+
 def _reap_once() -> None:
     # 多 API 副本时用 Redis 锁保证同一时刻只有一个在看门
-    if not r.set(REAPER_LOCK, "1", nx=True, ex=25):
+    if not r.set(REAPER_LOCK, "1", nx=True, ex=30):
         return
     try:
         for wid in list(r.smembers(WORKERS_SET)):
             if r.exists(f"ocr:worker:{wid}"):
                 continue  # 心跳还在 → 活着，跳过
             plist = f"ocr:processing:{wid}"
-            jobs = r.lrange(plist, 0, -1)
-            if jobs:
-                r.rpush(QUEUE, *jobs)                    # 重新入队
-                for jid in jobs:
+            try:
+                moved = r.eval(_REAP_LUA, 2, plist, QUEUE) or []
+            except Exception:
+                continue  # 这段失败就下次再试，绝不留下"半搬"的重复任务
+            for jid in moved:
+                try:
+                    # 状态重置失败无妨：任务已在队列，Worker 处理时会覆盖为 processing
                     r.hset(f"ocr:job:{jid}", "status", "pending")
                     r.hdel(f"ocr:job:{jid}", "processing_since")
-                r.delete(plist)
-            r.srem(WORKERS_SET, wid)
+                except Exception:
+                    pass
+            try:
+                r.srem(WORKERS_SET, wid)
+            except Exception:
+                pass
     finally:
-        r.delete(REAPER_LOCK)
+        try:
+            r.delete(REAPER_LOCK)
+        except Exception:
+            pass
 
 
 def _reaper_loop() -> None:
@@ -158,7 +184,10 @@ async def submit(
     _: None = Depends(require_auth),
 ) -> dict:
     # 背压：队列过长直接拒绝，保护系统不被冲垮
-    qlen = r.llen(QUEUE)
+    try:
+        qlen = r.llen(QUEUE)
+    except redis.RedisError as exc:
+        raise HTTPException(status_code=503, detail=f"redis unavailable: {exc}") from exc
     if qlen >= MAX_QUEUE:
         raise HTTPException(
             status_code=429,
@@ -173,17 +202,26 @@ async def submit(
     with open(tmp_path, "wb") as f:
         f.write(data)
 
-    r.hset(
-        f"ocr:job:{job_id}",
-        mapping={
-            "status": "pending",
-            "filename": file.filename or "",
-            "suffix": ext,
-            "max_pages": str(max_pages),
-            "created_at": str(time.time()),
-        },
-    )
-    r.rpush(QUEUE, job_id)
+    try:
+        r.hset(
+            f"ocr:job:{job_id}",
+            mapping={
+                "status": "pending",
+                "filename": file.filename or "",
+                "suffix": ext,
+                "max_pages": str(max_pages),
+                "created_at": str(time.time()),
+            },
+        )
+        r.rpush(QUEUE, job_id)
+    except redis.RedisError as exc:
+        # 入队失败（如 Redis 内存满 noeviction）：删掉刚落盘的文件，返回 503 让调用方重试
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise HTTPException(status_code=503, detail=f"queue write failed: {exc}") from exc
+
     return {"job_id": job_id, "status": "pending", "queue_position": qlen + 1}
 
 
@@ -195,7 +233,10 @@ def get_job(
     job_id: str,
     _: None = Depends(require_auth),
 ) -> dict:
-    data = r.hgetall(f"ocr:job:{job_id}")
+    try:
+        data = r.hgetall(f"ocr:job:{job_id}")
+    except redis.RedisError as exc:
+        raise HTTPException(status_code=503, detail=f"redis unavailable: {exc}") from exc
     if not data:
         raise HTTPException(status_code=404, detail="job not found")
     status = data.get("status")
