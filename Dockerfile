@@ -13,16 +13,17 @@ ENV PYTHONUNBUFFERED=1 \
     HF_HUB_OFFLINE=1 \
     TMPDIR=/tmp/indra \
     OCR_THREADS=8 \
-    OCR_WORKERS=1
+    REDIS_URL=redis://redis:6379/0
 
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py .
+# 同一镜像同时承载 API 与 Worker，靠启动命令区分
+COPY ocr_engine.py api.py worker.py ./
 
 EXPOSE 8000
 
-# 单 worker 足以应对低负载（200 文档/天）；多 worker 需配合 Redis 共享任务状态
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port 8000 --workers ${OCR_WORKERS:-1}"]
+# 默认启动 API；Worker 由 docker-compose 用 command 覆盖
+CMD ["sh", "-c", "uvicorn api:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS:-1}"]

@@ -1,27 +1,34 @@
-# Indra OCR API 服务（Docker 部署）
+# Indra OCR API 服务（Docker 部署 · v2.0 队列解耦版）
 
-> [Indra OCR](https://github.com/datalab-to/indra)（datalab-to 出品，纯 CPU 轻量 OCR）的 HTTP API 封装。FastAPI + Docker 一键部署，供知识库等系统调用。
+> [Indra OCR](https://github.com/datalab-to/indra)（datalab-to 出品，纯 CPU 轻量 OCR）的 HTTP API 封装。FastAPI + Redis + Worker 队列，供知识库等系统调用。
 > **许可证**：本项目代码 Apache 2.0（见 `LICENSE`）；Indra 模型权重为修改版 OpenRAIL-M，商用前请阅 [条款](https://huggingface.co/datalab-to/indra-ocr)。
-> **实测吞吐**：单页 0.5–2.0s（纯 CPU，无需 GPU）。快速部署见下方 §3 / §4；离线模型预置见 `scripts/prepare_models.sh`。
+> **实测吞吐**：单页 0.5–2.0s（纯 CPU，无需 GPU）。快速部署见 §3；离线模型预置见 `scripts/prepare_models.sh`。
 
 ---
 
-# Indra OCR 服务部署说明
+## 0. 这版为什么改架构
 
-把 `indra-ocr 1.1.2` 包装成 HTTP API，供知识库系统调用。
-实测每页 0.5–2.0s（纯 CPU，无需 GPU）。
+v1 是单进程内字典存任务——在你的原始约束（≤200 文档/天、单一内部调用、内网）下够用。但一旦**公开暴露**或面临**突发/批量高吞吐**，就必须解耦：
 
----
+- **公开** = 不可信外部调用 → 需要鉴权 + 限流 + 背压，否则谁都能打爆你。
+- **突发/批量**（如半小时内涌入几万文档）→ ingestion 和 processing 必须分开，否则客户端 hang 或内存雪崩。
 
-## 0. 你的负载与配置结论
+v2 把服务拆成三层，**API 只收任务立即返回 `job_id`，OCR 计算全在 Worker 池跑**：
 
-**实际负载（已确认）**：每天 ≤ 200 个文档（平均 ~20 页）→ 峰值 ~4000 页/天 ≈ **0.14 页/秒平均**。
-按此负载，连 1 个 CPU 核心都用不满。因此：
+```
+Nginx (限流+鉴权+背压)
+   │
+   ▼
+API   (极轻量，不加载模型)：收上传 → 落共享盘 → 写 Redis 任务+入队 → 立即返回 job_id
+   │                                  ▲
+   │ 队列 ocr:queue                   │ 结果写回任务哈希
+   ▼                                  │
+Worker 池 (加载模型，吃算力)：BRPOP 取任务 → 跑 OCR → 存结果 → 删文件
+```
 
-- **不需要队列**（Redis/RQ）—— 同步接口 + Nginx 限流即可；异步接口仅作大文件兜底。
-- **不需要负载均衡** —— 单机 32 核，多 worker 由 OS 调度，无需额外 LB。
-- **推荐配置**：8 核 / 12GB 限制 + 单 Uvicorn worker + `OCR_THREADS=8`。
-  你那台服务器有富余，分配 8 核给 OCR 对现有业务无感。
+**这套单机也能跑（比原来稳得多），要更高吞吐就加 Worker 副本 / 机器。**
+
+> ⚠️ **吞吐实话**：队列管理负载，但不创造算力。单机 32 核满打满算约 **~1 万文档/小时**到顶；要 3 万+/小时需多机跑 Worker 横向扩容（见 §4 扩容）。
 
 ---
 
@@ -29,14 +36,16 @@
 
 ```
 indra-ocr-service/
-├── app.py                  # FastAPI 应用
+├── api.py                  # API 服务（收任务、查状态、鉴权、背压）
+├── worker.py               # Worker（从队列取任务跑 OCR）
+├── ocr_engine.py           # OCR 引擎封装（被 Worker 加载，模型常驻）
 ├── requirements.txt
-├── Dockerfile
-├── docker-compose.yml
+├── Dockerfile              # 同一镜像，靠启动命令区分 api / worker
+├── docker-compose.yml      # redis + api + worker(replicas) + nginx
 ├── nginx.conf
 ├── scripts/prepare_models.sh   # 联网机预置模型（只需跑一次）
-├── models/                 # 离线模型（预置后由 compose 挂载，体积 ~72MB）
-└── tmp/                    # 临时上传文件（务必放数据盘）
+├── models/                 # 离线模型（预置后挂载，~72MB）
+└── tmp/                    # 上传文件共享盘（api 写、worker 读，务必放数据盘）
 ```
 
 ---
@@ -51,10 +60,9 @@ bash scripts/prepare_models.sh ./models
 # 模型缓存到 ./models，约 72MB
 ```
 
-把整个 `models/` 目录拷到内网服务器项目目录下，compose 会只读挂载为 `/opt/models`。
+把整个 `models/` 目录拷到内网服务器项目目录下，Worker 会只读挂载为 `/opt/models`。
 
-> ⚠️ 若跳过此步，`HF_HUB_OFFLINE=1` 会让服务启动即因无法下载模型而失败。
-> 离线环境务必确认 `models/hub/models--datalab-to--indra-ocr` 存在。
+> ⚠️ 若跳过此步，`HF_HUB_OFFLINE=1` 会让 Worker 启动即因无法下载模型而失败。
 
 ---
 
@@ -62,105 +70,59 @@ bash scripts/prepare_models.sh ./models
 
 ```bash
 cd indra-ocr-service
-# 可选：设置 API Key 鉴权（空则不鉴权）
+# 公开部署务必设置 API Key
 export INDRA_API_KEY="你的密钥"
 
-# 构建并启动
+# 构建并启动（redis + api + 4 个 worker + nginx）
 docker compose up -d --build
 
-# 查看健康
+# 健康检查
 curl http://localhost:8080/healthz
-# 期望: {"ok":true,"model_ready":true,...}
+# 期望: {"ok":true,"redis":true,"active_workers":4,"queued":0,...}
 ```
 
 **磁盘注意**：Docker 默认 `data-root` 在 `/var/lib/docker`（根分区）。
-若根分区紧张（如 / 只剩 40GB），把 `tmp/` 与 compose 的镜像数据迁到数据盘
-（如 `/www/indra/`），并配置 Docker `data-root` 到数据盘。
+若根分区紧张，把 `tmp/`、`redis-data/` 与镜像数据迁到数据盘（如 `/www/indra/`），并配置 Docker `data-root` 到数据盘。
 
 ---
 
-## 4. 裸机部署（无 Docker 时，Ubuntu）
+## 4. 横向扩容（应对高吞吐）
 
-```bash
-cd indra-ocr-service
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
+吞吐瓶颈在 **Worker 算力**，不在 API/Redis。扩容只看 Worker：
 
-# 模型目录（已预置）
-export HF_HOME=/opt/indra-models
-export HF_HUB_OFFLINE=1
-export OCR_THREADS=8
-export TMPDIR=/www/indra/tmp   # 放数据盘
+- **同机多副本**：`docker compose up -d --scale worker=N`（N = floor(机器核数 / OCR_THREADS)）。
+  例：32 核、`OCR_THREADS=8` → 同时跑 4 个 Worker 副本。
+- **跨机集群**：在更多机器上跑 Worker 容器，指向**同一个 Redis**（Redis 部署在内网可达处；文件共享盘换成对象存储 / NFS）。
+  API 是无状态的，也可多机部署在 Redis 前。
+- **队列做天然背压**：突发洪峰时任务在 Redis 里堆积，API 照常秒回 `job_id`；队列超过 `MAX_QUEUE`（默认 1000）才对客户端返回 `429`，保护系统不被冲垮。
 
-# 后台启动（systemd / nohup 自行封装）
-uvicorn app:app --host 0.0.0.0 --port 8000 --workers 1
-```
-
-systemd 单元示例（`/etc/systemd/system/indra-ocr.service`）：
-
-```ini
-[Unit]
-Description=Indra OCR API
-After=network.target
-
-[Service]
-WorkingDirectory=/opt/indra-ocr-service
-Environment=HF_HOME=/opt/indra-models
-Environment=HF_HUB_OFFLINE=1
-Environment=OCR_THREADS=8
-Environment=TMPDIR=/www/indra/tmp
-ExecStart=/opt/indra-ocr-service/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-```
-
-> Windows 部署注意：`usable_cores()` 在 Windows 退化为 `os.cpu_count()`，
-> 不感知 CPU 限制，需手动设 `OCR_THREADS`；用 NSSM 或计划任务做进程守护。
+> Worker 副本数 × `OCR_THREADS` 不应超过机器总核数，否则上下文切换反而掉速。
 
 ---
 
 ## 5. 调用示例
 
-**同步（图片 / ≤10 页 PDF）**
+**提交任务（立即返回 job_id）**
 
 ```bash
-curl -F "file=@扫描件.png" http://localhost:8080/v1/ocr
-# 带鉴权：
-curl -F "file=@doc.pdf" -F "api_key=你的密钥" http://localhost:8080/v1/ocr
+JID=$(curl -s -F "file=@扫描件.png" -F "api_key=你的密钥" \
+  http://localhost:8080/v1/jobs | python -c "import sys,json;print(json.load(sys.stdin)['job_id'])")
+echo "job: $JID"
 ```
 
-返回：
-```json
-{
-  "pages": [
-    {
-      "index": 0,
-      "text": "识别文本",
-      "markdown": "# 标题\n\n正文…",
-      "lines": [{"text": "…", "box": [x0,y0,x1,y1], "conf": 0.93}]
-    }
-  ],
-  "elapse": 1.42
-}
-```
-
-**异步（大 PDF / 批量）**
+**轮询结果**
 
 ```bash
-TID=$(curl -s -F "file=@book.pdf" http://localhost:8080/v1/ocr/async | python -c "import sys,json;print(json.load(sys.stdin)['task_id'])")
-curl http://localhost:8080/v1/tasks/$TID
+curl "http://localhost:8080/v1/jobs/$JID?api_key=你的密钥"
+# pending   → {"job_id":...,"status":"pending","queue_position":3}
+# processing→ {"job_id":...,"status":"processing"}
+# done      → {"job_id":...,"status":"done","result":{...},"elapse":1.42}
+# error     → {"job_id":...,"status":"error","error":"..."}
 ```
 
-> **批量导入建议（如半小时内传完 100 文档）**
-> - 调用方**走异步接口** `/v1/ocr/async` 而非同步等待，避免前端 hang 30 分钟；
->   传完拿到 `task_id` 后轮询 `/v1/tasks/{id}` 即可。
-> - 客户端**并发上传控制在 8–16 个**以内（与服务端 `limit_conn 16` 对齐），
->   不要一次性开 100 个并发连接。
-> - 单 worker + 进程内队列即可扛住（~4–8 页/秒），**无需 Redis 等外部队列**；
->   除非服务在处理途中重启（进行中任务丢失），由调用方按 `task_id` 重试补偿。
+> **批量导入建议**（如半小时内传完几万文档）：全部走 `/v1/jobs` 并发提交即可——
+> API 秒回、任务在 Redis 排队、Worker 池匀速消化；客户端按 `job_id` 轮询或拿到 `429` 后退避重试。
+> 不需要你在客户端自己维护队列。
 
 ---
 
@@ -168,20 +130,23 @@ curl http://localhost:8080/v1/tasks/$TID
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| GET | `/healthz` | 健康检查 |
-| POST | `/v1/ocr` | 同步 OCR（multipart: file, max_pages=10） |
-| POST | `/v1/ocr/async` | 异步 OCR（返回 task_id） |
-| GET | `/v1/tasks/{id}` | 查询异步任务结果 |
+| GET | `/healthz` | 健康检查（Redis 连通、在线 Worker 数、排队数） |
+| POST | `/v1/jobs` | 提交任务（multipart: `file`, `max_pages=0` 不限）→ 返回 `job_id` |
+| GET | `/v1/jobs/{id}` | 查询状态/结果（`pending`/`processing`/`done`/`error`） |
+
+鉴权：请求头 `X-API-Key` 或查询参数 `api_key`（设了 `INDRA_API_KEY` 才启用；空则不鉴权）。
+背压：队列 ≥ `MAX_QUEUE` 时 `POST /v1/jobs` 返回 **429**。
 
 ---
 
 ## 7. 运维要点
 
-1. **临时文件清理**：`app.py` 每次请求 `finally` 删除；另加 cron 兜底删除 1 小时前的文件：
+1. **临时文件清理**：Worker 处理完即删；另加 cron 兜底删 1 小时前的文件：
    `0 * * * * find /www/indra/tmp -type f -mmin +60 -delete`
-2. **限流**：Nginx `limit_req rate=10r/s burst=20`，防止突发打爆内存。
-3. **监控**：`/healthz` 探活 + P95 延迟（实际远低于瓶颈）。
-4. **合规**：Indra 权重为修改版 OpenRAIL-M，营收 >2000 万美元或与 Datalab API 竞争不可用，部署前确认。
+2. **Redis 容量**：任务完成保留 24h（`JOB_TTL`）后自动过期；Redis 配了 `maxmemory 1gb + allkeys-lru` 兜底，不会撑爆。
+3. **监控**：`/healthz` 探活 + `active_workers` / `queued`；Worker 心跳 TTL 30s，进程挂了会被探活发现。
+4. **扩容/缩容**：调 `worker` 副本数即可，API 与 Redis 不动。
+5. **合规**：Indra 权重为修改版 OpenRAIL-M，营收 >2000 万美元或与 Datalab API 竞争不可用，部署前确认。
 
 ---
 
@@ -189,11 +154,11 @@ curl http://localhost:8080/v1/tasks/$TID
 
 | 坑 | 规避 |
 |---|---|
-| 中文路径崩溃 | 临时文件用 `uuid4().hex` 纯 ASCII 文件名；**且 `TMPDIR` 目录路径本身也不能含中文**（实测：cv2.imread 连中文目录路径也读不了，会 500） |
+| 中文路径崩溃 | 任务文件用 `uuid4().hex` 纯 ASCII 文件名；**且 `TMPDIR` 目录路径本身也不能含中文**（cv2.imread 连中文目录路径也读不了，会 500） |
 | 内网无法下载模型 | 预置 `HF_HOME` + `HF_HUB_OFFLINE=1` |
-| 大 PDF 同步超时 | 超过 10 页走异步接口 |
-| 多 worker 任务状态丢失 | 单 worker 即可；多 worker 需改 Redis |
+| Worker 重启丢进行中任务 | 任务文件落在共享盘，重启后文件仍在但任务状态可能停在 pending；Worker 取到后会重新处理（幂等），结果以最终为准 |
 | 根分区被 Docker 写满 | data-root / 临时目录迁到数据盘 |
+| Redis 是关键依赖 | 没有 Redis 整个服务不可用；生产建议 Redis 持久化 + 主从 |
 
 ---
 
@@ -223,4 +188,3 @@ curl http://localhost:8080/v1/tasks/$TID
 | PaddleOCR | https://github.com/PaddlePaddle/PaddleOCR | 完整版含 PP-Structure，表格/竖排还原强；代价是需 PaddlePaddle 框架（~500MB+） |
 
 > 三者共同短板：手写体、竖排文字、复杂表格（合并单元格/多级表头/无框线）会丢结构，需上 VLM（如 PaddleOCR-VL / Qwen2.5-VL）补刀。
-

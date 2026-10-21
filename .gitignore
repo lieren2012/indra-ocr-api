@@ -7,6 +7,7 @@ venv/
 
 # ---- 运行时 / 部署产物（不入库）----
 tmp/            # 临时上传文件，运行时生成
+redis-data/     # Redis 持久化目录，compose 运行时生成
 models/         # 离线模型，按 scripts/prepare_models.sh 预置，不入库
 *.log
 
